@@ -2058,7 +2058,7 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// ([`relay`]): landings, flights landed, microseconds it waited for the
 /// card with nothing to land, microseconds it waited for fetches of card
 /// copies' pieces, microseconds of landing in all.
-static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static RELAY_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Of the line's things in order (a flight: the value signalled on the
 /// host's fence behind it; a write or a signal behind a flight: `None`):
@@ -2925,12 +2925,13 @@ fn late_line(frames: f64) {
         tracing::info!(
             "the relay per frame (VICTORY_RELAY=1): {:.1} flights landed in {:.1} landings by the thread that copies back, \
              beside the submitting thread; that thread waited {:.1} ms for the card with nothing to land and {:.1} ms for \
-             fetches of card copies' pieces, and was {:.1} ms landing in all (the frame line's \"copying back\" is its time; \
-             \"settles\" above are waits of other threads for it)",
+             fetches of card copies' pieces ({:.1} ms of it on the card), and was {:.1} ms landing in all (the frame line's \
+             \"copying back\" is its time; \"settles\" above are waits of other threads for it)",
             r[1],
             r[0],
             r[2] / 1000.0,
             r[3] / 1000.0,
+            r[5] / 1000.0,
             r[4] / 1000.0,
         );
     }
@@ -3979,12 +3980,17 @@ impl Host {
         };
         // SAFETY: the fence and event are this thread's, and the list's
         // last run was the fetch that was signalled on them.
+        let waiting = std::time::Instant::now();
         let _ = unsafe { WaitForSingleObject(f.event, INFINITE) };
+        // The card's own delay: the wait alone, not the submit before it
+        // nor the merge of the other copies that ran beside it (`p.at`).
+        let on_card = waiting.elapsed().as_micros() as u64;
         let us = p.at.elapsed().as_micros() as u64;
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
+        RELAY_STATS[5].fetch_add(on_card, Ordering::Relaxed);
         {
             use crate::shadow::CARD_STATS;
-            CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+            CARD_STATS[6].fetch_add(on_card, Ordering::Relaxed);
         }
         let mut title = Vec::new();
         let mut written = 0;
@@ -7173,7 +7179,7 @@ impl Meter {
                 tracing::info!(
                     "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} dirty ranges fetched \
-                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms), {:.0} readback copy commands",
+                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms waiting on it), {:.0} readback copy commands",
                     card[7],
                     card[8] >> 20,
                     card[9] >> 20,

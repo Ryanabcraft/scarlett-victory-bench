@@ -120,41 +120,46 @@ Measured, not inferred — every number below comes from a counter in the runtim
 
 | Stage | Cost per frame | Where it runs |
 |---|---|---|
-| preparing (CPU) | **305 ms** | submitting thread |
-| — recording the command lists | ~170 ms (34 µs a draw) | submitting thread |
-| — title → host copies | 146–247 MB at **250–460 MB/s** | `wide()` pool |
-| — textures | 19 ms / 50 MB | submitting thread |
-| waiting for the card | **266 ms**, of which 180–216 ms is *the title reading memory a shader may write* | submitting thread |
-| copying back | **408–432 ms** | relay thread |
-| — comparing the copies (find what changed) | 179–198 ms | `wide()` pool |
-| — snapshots (the "before" image) | 98–110 ms | `wide()` pool |
-| compared per frame | **585–731 MB** in 339–406 ranges | |
-| snapshotted per frame | **577–696 MB** | |
-| bytes that actually changed | **68–74 MB** | |
-| process CPU | 46.3 % of 8 threads = **~2.2 s of CPU a frame** | |
+| preparing (CPU) | **148–179 ms** | submitting thread |
+| — title → host copies | 90–116 ms / 155–177 MB | `wide()` pool |
+| — textures | 5–13 ms | submitting thread |
+| — recording the command lists | ~50 ms (~10 µs a draw) | submitting thread |
+| waiting for the card | **113–143 ms**, of which 130 ms is *the title reading memory a shader may write* | submitting thread |
+| copying back | **251–269 ms** | relay thread |
+| — **waiting for the fetch of what shaders wrote** | **157–167 ms** | relay thread |
+| — waiting for the card with nothing to land | 32–42 ms | relay thread |
+| — merging what came back | 6.5–13 ms | relay thread |
+| — snapshots (the "before" image) | 3.0–5.1 ms | `wide()` pool |
+| compared per frame on the CPU | **25 MB** | |
+| compared per frame on the card | **941 MB**, in 16,400 pieces of 64 KiB | GPU |
+| bytes fetched back | 39–55 MB in 1,300–2,000 ranges | GPU → CPU |
 
-Three numbers explain the rest:
+The comparison moved to the card. The card's own compute pass hashes every
+64 KiB piece of the title's buffers against the hashes it stored, returns a
+16-bit mask of the dirty 4 KiB pages per piece, and only those pages are
+fetched. That took the CPU comparison from 717 MB a frame to 25 MB: merge
+191–248 → 6.5–13 ms, snapshots 100–115 → 3.0–5.1 ms.
 
-1. **1.4 GB of memory traffic a frame** to discover ~70 MB of change.
-2. **The title → host copy runs at 250–460 MB/s.** A standalone benchmark on the
-   same machine gets 12.4 GB/s reading one stream and 4.4–5.8 GB/s copying with
-   a warm destination — but in the game the destination is cold and the ranges
-   are scattered, so the copy path lands at 1.85 GB/s aggregate.
-3. **The submitting thread cannot run ahead**: it blocks 180–216 ms a frame
-   waiting for the relay to hand over what the title reads. That read is real —
-   the title reads shader output (culling and instance buffers) every frame.
+Getting there needed **VRAM**: at 1,882 MB of texture copies the card was full
+when the world's buffers were copied, so 96–98 of them were refused and 700 MB
+a frame fell back to the CPU. `VICTORY_TEXTURE_BUDGET_MB` (768 MB by default
+now) is what leaves the room: 97 copies / 941 MB on the card, no refusals, and
+the frame went **477–585 → 339–371 ms**.
+
+What is left is one thing: **the fetch waits 157–167 ms a frame for a queue that
+has a whole frame of draws in front of it**, with the card at 26–32 % busy. It
+is not bandwidth (55 MB at 165 MB/s effective). It is ordering.
 
 The GPU is **not** the limit: the card's own clock shows it idle with work
 queued for a large part of the frame while the CPU records the lists.
 
 ### What that means for 30 fps
 
-The copy path can be removed entirely and the frame lands at ~300 ms — 3.3 fps.
-That is the ceiling of this architecture on this machine. 30 fps would need the
-coherence traffic to fall from 1.4 GB to ~50 MB a frame, which means **stopping
-asking memory what changed**: a dirty-page mask written by the shaders
-themselves (a shader-emitter project), or guest memory the GPU writes directly
-(another backend).
+The two CPU-side items that dominated the frame are gone. What remains, in
+order: the fetch's 157–167 ms of queue latency, the 90–116 ms of title → host
+copies, and the 130 ms the submitting thread spends waiting for shader output
+the title reads. 30 fps would need all three gone and the lists recorded in
+parallel — a different shape of renderer, not another optimisation pass.
 
 For scale: the upstream author measures **~10 fps** on a Ryzen 7 5700X3D with an
 RX 7800 XT — roughly three to four times this machine.

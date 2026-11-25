@@ -291,21 +291,149 @@ não a vazão da máquina: são 1,4 GB de tráfego por frame.
   são grandes: máscara de páginas sujas escrita pelos shaders (projeto de
   emissor), ou memória do convidado que a GPU escreve direto (outro backend).
 
+## Auditoria do upstream: as "write marks" já estiveram neste histórico
+
+A pergunta era se os commits `cd94d35388765f85d4dd88f24d444e018c468ccd` e
+`940d32f69b22265690a0b5a15d6ded572ba33baf` (Marvisak, marcação de páginas
+escritas pelos shaders) faltavam no nosso fork. **Faltam — mas não por
+desatualização.** Os dois são ancestrais da nossa base: chegaram, e depois foram
+**substituídos**.
+
+```
+940d32f  ← base comum das duas linhagens
+├── 570a941 "Publish DexNom Runtime Radeon sources"  (170 arquivos, −36.762 linhas)
+│   └── 2e01ab4 → ... → cda80b3   (24 commits, o nosso main)
+└── +83 commits                    (marvisak/main)
+```
+
+`git log -S'mark_entry'` mostra exatamente dois commits: `cd94d35` adiciona e
+`570a941` remove. O mesmo para `Write marks` no emissor. Não foi um revert
+cirúrgico: o `570a941` trocou a árvore por outra implementação do mesmo problema.
+
+**As duas arquiteturas são incompatíveis na raiz**, e os conflitos provam:
+
+| marcas (Marvisak) | a nossa base |
+|---|---|
+| `memory`, `memory_writes`, `view_addresses`, `heap`, `heap_writes`, `view_marks` | `written_root_uavs`, `writes_guest_memory`, `root_indexed_views` |
+
+O emissor da nossa base **não tem a tabela de páginas** (`t0`/`u0` em
+`MEMORY_SPACE`) que as marcas usam para traduzir endereço calculado em página.
+Portar as marcas seria portar a emulação de memória inteira junto.
+
+Medido, não estimado: merge completo de `marvisak/main` = **37 conflitos**;
+cherry-pick só dos dois commits = **20 conflitos**, incluindo 5 arquivos de teste
+que a nossa base apagou. Nenhum dos dois é um caminho razoável.
+
+**O que a nossa linhagem tem no lugar:** o caminho do cartão. Uma cópia de
+buffer do título grande fica na VRAM (`shadow::card_for`) e é comparada por um
+compute shader nosso, `CARD_COMPARE`, que devolve por peça de 64 KiB uma máscara
+de 16 bits das páginas de 4 KiB sujas — a mesma granularidade fina das marcas,
+sem tocar no emissor.
+
+## A espera do fetch, medida sem a contaminação do merge
+
+A linha do relé dizia "402 ms esperando fetches", mas a janela começava no
+*submit* do fetch e incluía o merge da CPU. Instrumentei a espera **pura**
+(`WaitForSingleObject` apenas, `RELAY_STATS[5]`):
+
+| run | cópias no cartão | espera pura do fetch | merge | snapshots | frame |
+|---|---|---|---|---|---|
+| `wait-174043` | 1 / 174 MB | **123–149 ms** | 191–216 ms | 108–115 ms | 477–585 ms |
+| `vram70-175704` | 41 / 536 MB | **231 ms** | 73,8 ms | 43,2 ms | 457–461 ms |
+| `room70-180632` | 2 / 175 MB | **143–175 ms** | 239–248 ms | 101–104 ms | 481–591 ms |
+
+A espera bate com o tempo de GPU por frame (125–251 ms) e a placa fica a 26–32 %
+de ocupação: o fetch não está esperando banda, está **enfileirado atrás de um
+frame inteiro de draws**. É o problema que o `queue2.rs` do PR #32 resolve.
+
+## O caminho do cartão vale, e o preço dele é a VRAM
+
+A/B direto, mesma build, mesma cena, só o switch:
+
+| | frame | merge | snapshots | relé |
+|---|---|---|---|---|
+| `VICTORY_CARD_BUFFERS=0` (tudo na CPU) | 575–671 ms | 244–287 ms | 153–176 ms | 282–339 ms |
+| padrão (caminho do cartão ligado) | 477–585 ms | 191–216 ms | 108–115 ms | 368–399 ms |
+
+**O caminho do cartão vale ~80–100 ms.** Desligá-lo não é opção.
+
+O que decide o tamanho do ganho é **quantos buffers cabem na VRAM**. Com 536 MB
+cardados em vez de 174 MB o merge caiu 191 → 74 ms e os snapshots 115 → 43 ms.
+Mas `card_for` recusa acima de 4/5 do orçamento, e o cartão chega ao carregamento
+do mundo a 92–93 %: **96–98 recusas por run**, 700 MB comparados na CPU.
+
+`VICTORY_TEXTURE_ROOM_PERCENT` **não é a alavanca** para isso — testado a 70 e
+depois como padrão no código: voltou a 2 cópias e 96 recusas. O `room()` só
+governa cópias de textura, e a variável não muda o que ocupa o cartão no
+carregamento. A run que cardou 536 MB foi **variância de VRAM**, não a variável.
+
+A alavanca é `VICTORY_TEXTURE_BUDGET_MB`, que limita de fato as nossas cópias de
+textura (1.882 MB) e portanto abre espaço para as cópias de buffer.
+
+### Resultado: 768 MB de textura, o resto para o cartão
+
+`VICTORY_TEXTURE_BUDGET_MB=768`, e depois como **padrão do código**, mesma cena
+(~5 000 draws), mesma build:
+
+| | antes | depois |
+|---|---|---|
+| cópias de buffer no cartão | 1–2 / 174 MB | **97 / 941 MB** |
+| recusas de "no room on the card" | 96–98 | **0** |
+| comparado na CPU por frame | 717–733 MB | **25 MB** |
+| relay merge | 191–248 ms | **6,5–13 ms** |
+| snapshots | 100–115 ms | **3,0–5,1 ms** |
+| copiar de volta (soma) | 308–352 ms | **14–22 ms** |
+| frame | 477–585 ms | **339–371 ms** |
+| fps no mundo | 1,7–2,1 | **2,7–3,0** |
+
+A comparação de 717 MB na CPU **acabou**: 941 MB de cópias de buffer moram na
+VRAM e são comparadas lá, com granularidade de 4 KiB, sobrando 25 MB para a CPU.
+É a resposta à pergunta do item 4 da operação: **sim, liberar VRAM transfere o
+trabalho do caminho lento da CPU para o caminho do cartão, e vale ~130 ms de
+frame.** O preço é o orçamento das cópias de textura (1.882 → 768 MB); as texturas
+que já estavam esperando por memória continuam esperando.
+
+Com o merge quase zerado, o frame agora é outra coisa:
+
+| etapa | custo | onde |
+|---|---|---|
+| preparar | 148–179 ms | thread principal (copies 90–116, texturas 5–13, listas ~50) |
+| esperar o cartão | 113–143 ms | thread principal (130 ms é "título leu memória de shader") |
+| copiar de volta | 251–269 ms | thread do relé |
+| — **espera pura do fetch** | **157–167 ms** | thread do relé |
+| — espera com nada para pousar | 32–42 ms | thread do relé |
+
+**O gargalo agora é um só: o fetch do que os shaders escreveram.** 157–167 ms por
+frame para buscar ~54 MB, com a placa a 26–32 % de ocupação. Não é banda — é fila.
+
 ## Próximas otimizações, por ordem de retorno
 
-1. **"Antes" incremental em vez de snapshot por frame** (o item que falta, e o
-   mais barato dos grandes): hoje o "antes" é copiado inteiro (577–696 MB) a cada
-   submissão. Se cada escrita na cópia — o refresh e o merge do que os shaders
-   escreveram — também for aplicada à imagem "antes", ela fica sempre igual à
-   cópia e o snapshot por frame some. O tráfego cai de 577 MB para ~230 MB
-   (69 MB do merge + 160 MB do refresh). Vale ~90 ms de wall e ~0,5 s de CPU.
-2. **Coalescer os runs do refresh**: 4 500–8 600 chamadas de ~38 KB por frame. Se
-   o custo for por chamada (percurso de tabela de página do kernel), juntar runs
-   separados por menos de uma página corta a conta em ordem de grandeza.
-3. **Dirty mask na GPU** (o item grande): cada store dos shaders traduzidos marca
-   1 bit por página de 64 KiB; a CPU lê 1,4 KB por frame. Elimina snapshot e
-   comparação de uma vez — mas é projeto de emissor de shader, não de uma rodada.
-4. **Os 170 ms de gravação de listas** (34 µs por draw, 10× o que uma camada
+1. **Fila de cópia própria para o fetch** (o `queue2` do PR #32 do upstream): é o
+   maior item removível, **123–231 ms de espera pura** por frame, e não é banda —
+   a placa está a 26–32 %. O fetch é submetido na fila principal e espera um frame
+   inteiro de draws passar na frente. Uma fila `D3D12_COMMAND_LIST_TYPE_COPY`
+   faria ele rodar ao lado. **Não é uma mudança segura de poucas linhas**: o merge
+   usa `Pending::after` (a ordem da fila no momento do fetch) para decidir quais
+   envios já estão incluídos, e numa fila separada o fetch pode rodar antes dos
+   envios que ele presumiu ver. Exige um fence por valor de ordem, ou fazer o
+   próprio `CARD_COMPARE` escrever os bytes sujos no readback (aí o fetch some e
+   a ordem é exata por construção, porque tudo fica na mesma submissão).
+2. ~~**VRAM para as cópias de buffer**~~ — **feito e medido**: 768 MB de
+   orçamento de textura como padrão põe 97 cópias / 941 MB no cartão, zera as
+   recusas, tira 700 MB da CPU e leva o frame de 477–585 para 339–371 ms.
+3. **"Antes" incremental em vez de snapshot por frame** (~100 ms): hoje o "antes"
+   é copiado inteiro (577–696 MB) a cada submissão. Se cada escrita na cópia — o
+   refresh e o merge do que os shaders escreveram — também for aplicada à imagem
+   "antes", o snapshot por frame some.
+4. **Os ~146 ms de gravação de listas** (~30 µs por draw, 10× o que uma camada
    D3D12 bem escrita gasta). Precisa de um profiler de amostragem na thread
    principal; o build `diagnostics` não serve (6–13 s por frame).
+5. **Dirty mask no emissor**: descartado como próximo passo. As marcas do
+   Marvisak exigem a tabela de páginas, que a nossa linhagem não tem (ver a
+   auditoria acima). O caminho equivalente aqui é o `CARD_COMPARE`, e ele já
+   entrega granularidade de 4 KiB.
+
+**Descartado com número:** coalescer os runs do refresh não ganha nada — o
+benchmark isolado mostra que não há custo por chamada (38 KB custam 20,4 µs,
+22,8 MB custam 12 ms, mesma vazão).
 

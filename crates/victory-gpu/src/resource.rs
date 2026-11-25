@@ -1370,21 +1370,35 @@ pub(crate) fn host_made<'a>(
 }
 
 /// Whether more host copies of textures the title fills may be made for
-/// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to `FLOOR` bytes of them, beyond that while the card's memory in use
-/// by this process is under nine tenths of the budget the system gives it
-/// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
-/// limit on those copies' bytes instead). Past the budget the system moves
-/// the card's memory into the PC's, which ended runs 20 and 24.
+/// shaders that pick textures by index (`draw.rs` `heap_textures`):
+/// `VICTORY_TEXTURE_BUDGET_MB` bytes of them, 768 MB by default, because the
+/// card's room has to go to the copies of title buffers it compares
+/// ([`room_percent`] is the old rule, kept for `VICTORY_TEXTURE_BUDGET_MB=0`:
+/// always up to `FLOOR` bytes, beyond that while the card's memory in use by
+/// this process is under nine tenths of the budget the system gives it).
+/// Past the budget the system moves the card's memory into the PC's, which
+/// ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    // 768 MB by default (it was: no limit but the card's own room). This is
+    // the one switch that decides how many of the title's buffers the card
+    // compares instead of the CPU. At 1,882 MB of texture copies the card
+    // was full when the world's buffers were copied: 96-98 refusals, 717 MB
+    // a frame compared on the CPU, merge 191-248 ms and snapshots
+    // 100-115 ms. At 768 MB: 97 copies and 941 MB on the card, no refusals,
+    // 25 MB compared on the CPU, merge 6.5-13 ms, snapshots 3.0-3.2 ms, and
+    // the frame went from 477-585 ms to 351-371 ms (2026-11-25, run 18:14,
+    // same scene and build). `VICTORY_TEXTURE_BUDGET_MB=0` means no limit.
     let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+        let mb = match std::env::var("VICTORY_TEXTURE_BUDGET_MB") {
+            Ok(v) => v.trim().parse::<u64>().ok()?,
+            Err(_) => 768,
+        };
+        (mb != 0).then(|| mb << 20)
     });
     let filled = KINDS[1].load(Relaxed);
     if let Some(limit) = limit {
@@ -1406,6 +1420,14 @@ pub(crate) fn room() -> bool {
 /// textures wait (runs 170-174); the card copies of title buffers from
 /// 1 MiB up take 449 MB more of the card than before (941 against 492),
 /// and 94 gives the textures about that much back.
+///
+/// It does **not** decide how many title buffers go to the card's memory:
+/// tried at 70 both as the switch and as the default (2026-11-25, runs
+/// 17:57 and 18:06), the world still carded 2 copies and was refused 96
+/// times. What fills the card before the copies are made is the title's
+/// own memory, which this does not govern; `VICTORY_TEXTURE_BUDGET_MB`
+/// limits our texture copies themselves and is the switch that does move
+/// work off the CPU.
 #[cfg(windows)]
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
