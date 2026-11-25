@@ -143,6 +143,16 @@ the one that recurs is `host.rs`, where this fork's `BACK_PARTS` timing sits in
 the same lines as upstream's `WriteGroups`. `fork` is the remote this repo
 pushes to.
 
+**After any merge that touches the shader emitter, run `warm-shaders.bat`
+before measuring.** Shader hashes change, the 5 GB cache is invalid, and the
+first run then spends minutes at 10–12 s a frame compiling pipelines mid-game
+(`dropped 764 without a host pipeline (961 being made)`). The preloader
+translates and compiles everything up front instead.
+
+Measured cost of the merge itself (`921d8d3` → `2e01ab4`) in this fork: 486–546
+ms → 588–760 ms per frame, mostly relay merge and snapshots; the previous
+build is the commit before it if you need to go back.
+
 ## Upstream
 
 - [DexNom/VIctory](https://github.com/DexNom/VIctory) — the snapshot this fork

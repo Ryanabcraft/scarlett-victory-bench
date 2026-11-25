@@ -124,7 +124,47 @@ com orçamento de **512 MiB / 512 buffers**, escolhendo o menor backing que
 serve. O comentário do upstream diz o motivo: *"limiting this pool to eight
 buffers discarded already committed pages even when most of the byte budget was
 free"*. Ou seja — o custo de snapshot que este fork mediu (94–119 ms) era em
-parte alocação nova e page fault, não cópia. Medido abaixo.
+parte alocação nova e page fault, não cópia.
+
+### Medido com o merge, mesma build, mundo carregado
+
+| | antes do merge | com o merge |
+|---|---|---|
+| fps | 1,8–2,1 | **1,5–1,7** |
+| ms/frame | 486–546 | **588–760** |
+| draws/frame | 5 000–6 900 | 4 484–5 182 |
+| cópias título → host | 99–142 ms | 115–182 ms |
+| trabalho/espera da GPU | 136–224 ms | 122–379 ms |
+| copying back | 358–428 ms | 433–517 ms |
+| relay merge | 168–227 ms | 234–306 ms |
+| snapshots | 94–119 ms | 125–134 ms |
+| imagem | correta | correta |
+| crashes | 0 | 0 |
+
+**O pool novo não ajudou aqui — piorou os snapshots (94–119 → 125–134 ms)**, e o
+relay merge subiu junto. As duas medidas não são da mesma cena (draws e % de GPU
+diferem), então o número honesto é: o merge custa **~70–150 ms por frame** nesta
+máquina, e não é regressão do caminho de memória que este fork mexeu. O commit
+`f3a0fdc` é a build anterior ao merge, inteira, se for preciso voltar.
+
+### Cache de shader: o merge invalida os 5 GB
+
+O merge mexeu em `victory-shader/src/emit/lower.rs` e `typed_views.rs`, e isso
+muda o hash de todo shader traduzido. Consequência medida: o primeiro run depois
+do merge passou **~4 minutos a 10–12,5 s por frame** com
+`dropped 764 without a host pipeline (961 being made)`, reescrevendo 72 885
+arquivos de cache (5,2 GB). Depois assentou em 588–760 ms.
+
+Para não pagar isso dentro do jogo, `warm-shaders.bat` roda
+`victory-warm.exe`, que traduz e compila tudo para o cache antes:
+
+```bat
+target\release\victory-warm.exe "D:\...\game_scarlett_master.exe"
+```
+
+Regra prática: **mudou o emissor de shader (qualquer merge do upstream mexe),
+rode o `warm-shaders.bat` antes de medir fps.** Medir com cache frio dá 12 s por
+frame e não diz nada sobre o runtime.
 
 ## O que foi tentado e descartado (com o número)
 
