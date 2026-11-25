@@ -358,9 +358,11 @@ fn sharing_from(value: Option<&str>) -> Sharing {
 #[derive(Debug)]
 struct FrameWait {
     frame: u64,
-    /// The waiting counted against the budget so far (the window: time in
-    /// which some thread waited, up to `since`).
+    /// Completed waiting in this frame, excluding open wait windows and reservations.
     spent: Duration,
+    reserved: Duration,
+    /// Waiting beyond the ordinary frame budget across frames of this kind.
+    loading_spent: Duration,
     /// The window: threads waiting now, and since when one has been.
     waiting: u32,
     since: Option<Instant>,
@@ -368,13 +370,31 @@ struct FrameWait {
 
 impl FrameWait {
     const fn new() -> FrameWait {
-        FrameWait { frame: u64::MAX, spent: Duration::ZERO, waiting: 0, since: None }
+        FrameWait {
+            frame: u64::MAX,
+            spent: Duration::ZERO,
+            reserved: Duration::ZERO,
+            loading_spent: Duration::ZERO,
+            waiting: 0,
+            since: None,
+        }
+    }
+
+    fn budget(&self, frame: u64, base: Duration, compute: bool, allowance: Duration) -> Duration {
+        // This frame already loses its completed waits in begin. Only
+        // earlier frames reduce the loading allowance used for its budget.
+        let prior = if self.frame == frame {
+            self.loading_spent.saturating_sub(self.spent.saturating_sub(base))
+        } else {
+            self.loading_spent
+        };
+        frame_budget(base, compute, allowance, prior)
     }
 
     /// A thread is to wait in `frame` at `now`: how long it may.
     fn begin(&mut self, sharing: Sharing, frame: u64, budget: Duration, now: Instant) -> Duration {
         if self.frame != frame {
-            *self = FrameWait { frame, ..FrameWait::new() };
+            *self = FrameWait { frame, loading_spent: self.loading_spent, ..FrameWait::new() };
         }
         if sharing == Sharing::Window {
             let open = self.since.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
@@ -387,9 +407,9 @@ impl FrameWait {
             }
             return left;
         }
-        let left = budget.saturating_sub(self.spent);
+        let left = budget.saturating_sub(self.spent + self.reserved);
         if sharing == Sharing::Reserve {
-            self.spent += left;
+            self.reserved += left;
         }
         left
     }
@@ -397,10 +417,19 @@ impl FrameWait {
     /// The thread that [`begin`](Self::begin) gave `left` (more than
     /// nothing) in `frame` has waited `waited`, and stops at `now`. A frame
     /// that began meanwhile has its own budget.
-    fn end(&mut self, sharing: Sharing, frame: u64, left: Duration, waited: Duration, now: Instant) {
+    fn end(
+        &mut self,
+        sharing: Sharing,
+        frame: u64,
+        base: Duration,
+        left: Duration,
+        waited: Duration,
+        now: Instant,
+    ) {
         if self.frame != frame {
             return;
         }
+        let previous_extra = self.spent.saturating_sub(base);
         match sharing {
             Sharing::Window => {
                 self.waiting = self.waiting.saturating_sub(1);
@@ -410,9 +439,13 @@ impl FrameWait {
                     self.spent += now.saturating_duration_since(at);
                 }
             }
-            Sharing::Reserve => self.spent = self.spent.saturating_sub(left - waited),
+            Sharing::Reserve => {
+                self.reserved = self.reserved.saturating_sub(left);
+                self.spent += waited;
+            }
             Sharing::PerThread => self.spent += waited,
         }
+        self.loading_spent += self.spent.saturating_sub(base) - previous_extra;
     }
 }
 
@@ -422,19 +455,19 @@ fn wait(p: &Pending, frame: u64) {
     if base.is_zero() || p.slow() {
         return;
     }
-    // What was waited past the base budget since the start, in
-    // milliseconds, by kind (others, compute).
-    static PAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let compute = p.computes();
-    let past = &PAST[usize::from(compute)];
-    let budget = frame_budget(base, compute, loading_allowance(), Duration::from_millis(past.load(Ordering::Relaxed)));
+    let allowance = loading_allowance();
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now), by kind.
     static FRAMES: [Mutex<FrameWait>; 2] = [const { Mutex::new(FrameWait::new()) }; 2];
     let frame_wait = &FRAMES[usize::from(compute)];
     let sharing = shared_budget();
     let started = Instant::now();
-    let left = frame_wait.lock().unwrap_or_else(|e| e.into_inner()).begin(sharing, frame, budget, started);
+    let left = {
+        let mut wait = frame_wait.lock().unwrap_or_else(|e| e.into_inner());
+        let budget = wait.budget(frame, base, compute, allowance);
+        wait.begin(sharing, frame, budget, started)
+    };
     if left.is_zero() {
         return;
     }
@@ -451,8 +484,10 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
-    past.fetch_add(waited.saturating_sub(base).as_millis() as u64, Ordering::Relaxed);
-    frame_wait.lock().unwrap_or_else(|e| e.into_inner()).end(sharing, frame, left, waited, Instant::now());
+    frame_wait
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .end(sharing, frame, base, left, waited, Instant::now());
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
@@ -619,11 +654,11 @@ mod loading_tests {
         assert_eq!(a, budget);
         assert_eq!(b, budget - ms, "the second thread drops its pipeline at once: {sharing:?} gives it {b:?}");
         // Both made after 2 s: 2 s of the window gone.
-        w.end(sharing, 7, a, Duration::from_secs(2), t0 + Duration::from_secs(2));
-        w.end(sharing, 7, b, Duration::from_secs(2) - ms, t0 + Duration::from_secs(2));
+        w.end(sharing, 7, budget, a, Duration::from_secs(2), t0 + Duration::from_secs(2));
+        w.end(sharing, 7, budget, b, Duration::from_secs(2) - ms, t0 + Duration::from_secs(2));
         assert_eq!(w.begin(sharing, 7, budget, t0 + Duration::from_secs(5)), Duration::from_secs(10));
         // That thread waits out the rest: the window is used up.
-        w.end(sharing, 7, Duration::from_secs(10), Duration::from_secs(10), t0 + Duration::from_secs(15));
+        w.end(sharing, 7, budget, Duration::from_secs(10), Duration::from_secs(10), t0 + Duration::from_secs(15));
         assert_eq!(w.begin(sharing, 7, budget, t0 + Duration::from_secs(16)), Duration::ZERO);
         // The next frame.
         assert_eq!(w.begin(sharing, 8, budget, t0 + Duration::from_secs(17)), budget);
@@ -641,7 +676,7 @@ mod loading_tests {
         let mut w = FrameWait::new();
         assert_eq!(w.begin(Sharing::PerThread, 1, budget, t0), budget);
         assert_eq!(w.begin(Sharing::PerThread, 1, budget, t0), budget);
-        w.end(Sharing::PerThread, 1, budget, Duration::from_secs(3), t0);
+        w.end(Sharing::PerThread, 1, budget, budget, Duration::from_secs(3), t0);
         assert_eq!(w.begin(Sharing::PerThread, 1, budget, t0), Duration::from_secs(9));
         assert_eq!(sharing_from(Some("0")), Sharing::PerThread);
         assert_eq!(sharing_from(Some("reserve")), Sharing::Reserve);
@@ -661,6 +696,45 @@ mod loading_tests {
         assert_eq!(frame_budget(base, true, allowance, Duration::from_secs(130)), base);
         assert_eq!(frame_budget(base, false, Duration::ZERO, Duration::ZERO), base, "VICTORY_PIPELINE_GATE_S=0");
         assert_eq!(frame_budget(Duration::from_secs(20), true, allowance, Duration::ZERO), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn short_waits_use_the_loading_allowance_when_the_frame_exceeds_the_base() {
+        let base = Duration::from_millis(500);
+        let allowance = Duration::from_secs(1);
+        let short = Duration::from_millis(400);
+        let start = Instant::now();
+        for sharing in [Sharing::Window, Sharing::Reserve, Sharing::PerThread] {
+            let mut frame = FrameWait::new();
+            for (offset, duration) in [
+                (Duration::ZERO, short),
+                (short, short),
+                (short * 2, Duration::from_millis(200)),
+            ] {
+                let budget = frame.budget(1, base, false, allowance);
+                let left = frame.begin(sharing, 1, budget, start + offset);
+                assert_eq!(left, allowance - offset);
+                frame.end(sharing, 1, base, left, duration, start + offset + duration);
+            }
+            assert_eq!(frame.loading_spent, base);
+            assert_eq!(frame.budget(2, base, false, allowance), base);
+        }
+    }
+
+    #[test]
+    fn overlapping_waits_charge_one_window() {
+        let start = Instant::now();
+        let base = Duration::from_millis(500);
+        let allowance = Duration::from_secs(1);
+        let waited = Duration::from_millis(800);
+        let mut frame = FrameWait::new();
+        let first = frame.begin(Sharing::Window, 1, allowance, start);
+        let second = frame.begin(Sharing::Window, 1, allowance, start);
+        frame.end(Sharing::Window, 1, base, first, waited, start + waited);
+        frame.end(Sharing::Window, 1, base, second, waited, start + waited);
+        let extra = waited - base;
+        assert_eq!(frame.loading_spent, extra);
+        assert_eq!(frame.budget(2, base, false, allowance), allowance - extra);
     }
 
     /// No frame waits for a pipeline the driver has held past 10 s
