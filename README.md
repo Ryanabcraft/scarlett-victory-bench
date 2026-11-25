@@ -128,6 +128,21 @@ Full numbers, method and every discarded attempt:
 `start-rt.bat` runs the same build with `--rt` (structure builder, ray traversal
 and light resolve). On an RTX 3050 expect seconds per frame.
 
+## Keeping up with upstream
+
+Nothing syncs by itself — GitHub does not merge fork into fork, and upstream
+opens no pull requests here. `origin` still points at `DexNom/VIctory`, so:
+
+```powershell
+.\sync-upstream.ps1            # fetch, merge, build, push if the build is green
+.\sync-upstream.ps1 -NoPush    # fetch and build only
+```
+
+It stops on the first conflict and leaves the merge open to resolve by hand;
+the one that recurs is `host.rs`, where this fork's `BACK_PARTS` timing sits in
+the same lines as upstream's `WriteGroups`. `fork` is the remote this repo
+pushes to.
+
 ## Upstream
 
 - [DexNom/VIctory](https://github.com/DexNom/VIctory) — the snapshot this fork
