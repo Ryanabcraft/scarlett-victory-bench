@@ -115,31 +115,53 @@ the switch.
 
 ## Where the frame goes now
 
-| Stage | Cost per frame |
-|---|---|
-| comparing what shaders wrote (relay) | 168–227 ms |
-| snapshots of the declared ranges | 94–119 ms |
-| title → host copies | 99–142 ms |
-| GPU work and wait | 136–224 ms |
-| GPU fetch | 1.4–2.1 ms |
+Measured, not inferred — every number below comes from a counter in the runtime
+(`host.rs`, `shadow.rs`), on a ~5,000-draw scene at 1080p:
 
-CPU at 48 % and GPU at 35 % means neither is saturated: the frame is
-**synchronisation latency and memory bandwidth**. The readback path moves
-**1.4 GB per frame to find 1.9 MB of changed bytes** — 705 MB of snapshot and
-705 MB × 2 of comparison, at ~6.5 GB/s with six threads, which is this
-machine's practical ceiling.
+| Stage | Cost per frame | Where it runs |
+|---|---|---|
+| preparing (CPU) | **305 ms** | submitting thread |
+| — recording the command lists | ~170 ms (34 µs a draw) | submitting thread |
+| — title → host copies | 146–247 MB at **250–460 MB/s** | `wide()` pool |
+| — textures | 19 ms / 50 MB | submitting thread |
+| waiting for the card | **266 ms**, of which 180–216 ms is *the title reading memory a shader may write* | submitting thread |
+| copying back | **408–432 ms** | relay thread |
+| — comparing the copies (find what changed) | 179–198 ms | `wide()` pool |
+| — snapshots (the "before" image) | 98–110 ms | `wide()` pool |
+| compared per frame | **585–731 MB** in 339–406 ranges | |
+| snapshotted per frame | **577–696 MB** | |
+| bytes that actually changed | **68–74 MB** | |
+| process CPU | 46.3 % of 8 threads = **~2.2 s of CPU a frame** | |
 
-The next step is a **dirty mask written by the shaders themselves** — one bit
-per 64 KiB page, 1.4 KB a frame instead of 1.4 GB. The comment on
-`Shadow::writing` has asked for it since before this fork.
+Three numbers explain the rest:
 
-The second half of the ceiling is the GPU: 136–224 ms a frame on an RTX 3050
-inside the world. Even with a free CPU that is ~5–7 fps. 30 fps here would mean
-fewer draws, a lower resolution or lower quality — an image decision, not a
-code one.
+1. **1.4 GB of memory traffic a frame** to discover ~70 MB of change.
+2. **The title → host copy runs at 250–460 MB/s.** A standalone benchmark on the
+   same machine gets 12.4 GB/s reading one stream and 4.4–5.8 GB/s copying with
+   a warm destination — but in the game the destination is cold and the ranges
+   are scattered, so the copy path lands at 1.85 GB/s aggregate.
+3. **The submitting thread cannot run ahead**: it blocks 180–216 ms a frame
+   waiting for the relay to hand over what the title reads. That read is real —
+   the title reads shader output (culling and instance buffers) every frame.
 
-Full numbers, method and every discarded attempt:
+The GPU is **not** the limit: the card's own clock shows it idle with work
+queued for a large part of the frame while the CPU records the lists.
+
+### What that means for 30 fps
+
+The copy path can be removed entirely and the frame lands at ~300 ms — 3.3 fps.
+That is the ceiling of this architecture on this machine. 30 fps would need the
+coherence traffic to fall from 1.4 GB to ~50 MB a frame, which means **stopping
+asking memory what changed**: a dirty-page mask written by the shaders
+themselves (a shader-emitter project), or guest memory the GPU writes directly
+(another backend).
+
+For scale: the upstream author measures **~10 fps** on a Ryzen 7 5700X3D with an
+RX 7800 XT — roughly three to four times this machine.
+
+Full numbers, the benchmark method and every discarded attempt:
 [`PERFORMANCE.md`](PERFORMANCE.md).
+
 
 ## Run it on your PC
 

@@ -352,6 +352,11 @@ static BACK_PARTS: [std::sync::atomic::AtomicU64; 7] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Refreshes of host copies from title memory since the last frame line:
+/// microseconds, bytes copied, calls, and of those bytes how many came from
+/// copies the write watch cannot follow (copied whole every frame).
+pub(crate) static REFRESH: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// The card's clock, for the frame line of every run, in microseconds since
 /// the last one: how long the card had nothing of ours queued; how much of
 /// that while the thread that holds the submission lock was working (the
@@ -6350,6 +6355,9 @@ impl Batch {
         crate::copystat::range(from, to - from, us, 0);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        REFRESH[0].fetch_add(us, Ordering::Relaxed);
+        REFRESH[1].fetch_add(copied as u64, Ordering::Relaxed);
+        REFRESH[2].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -6460,6 +6468,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
+    if !title_dst && crate::plaincopy::copy(dst, src, len) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+        return;
+    }
     let whole = read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
@@ -7030,6 +7043,19 @@ impl Meter {
         );
         late_line(frames);
         card_clock_line(frames, ms);
+        crate::plaincopy::line(frames);
+        {
+            let [us, bytes, calls, whole] = [0, 1, 2, 3].map(|i| REFRESH[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "title memory copied into host copies per frame: {:.1} ms for {:.1} MB in {:.0} calls ({:.0} MB/s), \
+                 {:.1} MB of it from copies the write watch cannot follow",
+                us / 1e3,
+                bytes / 1e6,
+                calls,
+                if us > 0.0 { bytes / us } else { 0.0 },
+                whole / 1e6
+            );
+        }
         crate::shadow::back_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);

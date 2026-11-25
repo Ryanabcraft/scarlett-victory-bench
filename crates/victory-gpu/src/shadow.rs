@@ -2551,6 +2551,7 @@ impl Shadow {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
+        crate::host::REFRESH[3].fetch_add((to - from) as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);

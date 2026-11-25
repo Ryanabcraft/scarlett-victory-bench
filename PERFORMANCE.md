@@ -215,36 +215,97 @@ Prova: print da cena em `logs/shot-1080p.png` (fora do repo, `/logs/` é ignorad
 | `VICTORY_RELAY=1` sozinho | pior: desliga o `relay_exact` |
 | `VICTORY_CARD_BUFFERS_IN_RAM=1` (compare na GPU lendo a RAM) | pior: 710–748 ms, GPU 459–467 ms de espera; 700 MB por frame pela PCIe custa mais que a comparação na CPU. Fica no código, desligado |
 | `VICTORY_FAST_COPY=1` (`memcpy` com SEH, `fastcopy.c`) | pior: cópias 127–205 ms contra 104–147; um range com uma página faltando falha inteiro e o retry de 64 KiB custa mais que a cópia do kernel. Fica no código, desligado |
+| `VICTORY_COPY_PLAIN=1` (PR #32: `rep movsb` + handler de exceção) | **neutro**: 269–484 MB/s contra 247–462 MB/s do kernel, mesma cena, 4 500–6 500 chamadas de ~38 KB. O benchmark isolado explica: com destino residente o `memcpy` faz 3,9–5,8 GB/s contra 1,9–3,4 GB/s do `ReadProcessMemory`, mas no runtime o destino é frio e os dois empatam |
+| `VICTORY_KEEP_SNAPSHOTS=1` (+`_MB=2048`) | **não dá para isolar**: `relay()` devolve `false` quando `keeps()` está ligado (`&& !keeps()`), então o teste virou "relé desligado + snapshot mantido". Ficou 553–727 ms com 1 851–3 774 draws, contra 563–612 ms com ~5 000 draws do relé ligado — inconclusivo e não habilitado |
 | pool de `wide()`: 2 → 4 → 6 threads | melhora pequena e real: snapshots 130 → 94 ms |
 
-## Por que não dá para ir muito além sem mudar a arquitetura
+## Onde os 652 ms estão (medido, não estimado)
 
-Com CPU a 48 % e GPU a 35 %, nenhum dos dois está saturado: o frame é
-**latência de sincronização e banda de memória**, não cálculo. O caminho de
-volta move **1,4 GB por frame** para descobrir **1,9 MB** de bytes alterados:
+Cena do mundo, ~5 000 draws, 1080p, RTX 3050 + i3-10105 (4 núcleos / 8 threads).
+Cada linha sai de um contador do próprio runtime (`host.rs`, `shadow.rs`,
+`plaincopy.rs`), não de inferência.
 
-- snapshot: copia os 705 MB de ranges declarados (o "antes" de cada um);
-- comparação: lê os 705 MB do snapshot e os 705 MB da cópia, e acha 1,9 MB.
+| Etapa | Medida | Onde roda |
+|---|---|---|
+| preparar (CPU da thread principal) | **305 ms** | thread principal |
+| — gravar as listas de comando | ~170 ms (34 µs por draw) | thread principal |
+| — refreshes título → host | 146–247 MB a **247–462 MB/s** em 4 538–8 648 chamadas | pool `wide()` |
+| — texturas | 19 ms / 50 MB | thread principal |
+| espera pela GPU (bloqueio) | **266 ms**, dos quais **180–216 ms** são "o título leu memória que um shader pode escrever" | thread principal |
+| copiar de volta (thread do relé) | **408–432 ms** | thread do relé |
+| — merge das cópias em RAM (comparação) | **179–198 ms** | pool `wide()` |
+| — snapshots (copiar o "antes") | **98–110 ms** | pool `wide()` |
+| — espera do fetch + merge do cartão | ~244 ms (derivado) | thread do relé |
+| volume comparado por frame | **585–731 MB** em 339–406 ranges | |
+| volume snapshotado por frame | **577–696 MB** | |
+| bytes que realmente mudaram | **68–74 MB** | |
+| CPU do processo | 46,3 % de 8 threads = **~2,2 s de CPU por frame** | |
+| VRAM | 7,50 GB de 7,52 GB de orçamento; 98 recusas de "card copy: no room" | |
 
-Nesta máquina (4 núcleos, DDR4) isso roda a ~6,5 GB/s com 6 threads, que é o
-teto prático da banda. **A única forma de cortar é parar de tocar nos 705 MB**:
-uma máscara de páginas sujas escrita pelos próprios shaders na GPU — 1 bit por
-página de 64 KiB, 1,4 KB por frame em vez de 1,4 GB. O próprio código pede isso
-no comentário de `Shadow::writing`.
+Três números explicam o resto:
 
-A segunda parte do teto é a GPU: 136–224 ms de trabalho por frame nesta RTX
-3050 dentro do mundo. Mesmo com CPU zero, isso limita o frame a ~5–7 fps. Para
-30 fps estáveis seria preciso reduzir resolução, draws ou qualidade — e isso é
-uma decisão de imagem, não de código.
+1. **1,4 GB de tráfego de memória por frame** (160 MB refresh + 577–696 MB
+   snapshot + 585–731 MB comparação + 69 MB de volta) para descobrir **~70 MB**
+   de alteração. A banda de DRAM desta máquina é o teto dessa conta.
+2. **O refresh título → host roda a 250–460 MB/s** porque cada range de ~38 KB
+   é uma chamada `ReadProcessMemory` que faz o kernel percorrer as tabelas de
+   página uma a uma. São 4 500–8 600 chamadas por frame.
+3. **A thread principal não pode correr na frente**: ela bloqueia 180–216 ms por
+   frame esperando o relé entregar o que o jogo lê. O jogo lê saída de shader
+   (buffer de culling/instâncias) e essa leitura é uma dependência real.
+
+## A banda desta máquina, medida
+
+Benchmark isolado (Rust, mesma máquina, buffers residentes):
+
+| Padrão | 1 thread | 4 threads |
+|---|---|---|
+| leitura de 1 stream (1 GiB) | 12,4 GB/s | 22,0 GB/s |
+| `memcpy` (ler + escrever), destino quente | 4,4–5,8 GB/s | — |
+| `ReadProcessMemory` de 4 600 ranges de 38 KB | 1,9–3,4 GB/s | — |
+| comparação de 2 streams | 12,4 GB/s | — |
+
+Duas conclusões que fecham portas:
+
+- **O método de cópia não importa** no runtime: `ReadProcessMemory` e `memcpy`
+  empatam porque o destino é memória fria. Foi por isso que o `plaincopy` deu
+  neutro (269–484 MB/s contra 247–462).
+- **Não há custo por chamada**: 38 KB custam 20,4 µs e 22,8 MB custam 12 ms —
+  a mesma vazão. Coalescer os 7 632 ranges do refresh não ganharia nada.
+
+O caminho de cópia entrega **1,85 GB/s agregado** (308–321 MB/s por thread × 6
+threads), contra 22 GB/s de banda disponível. O limite é a **soma dos bytes**,
+não a vazão da máquina: são 1,4 GB de tráfego por frame.
+
+## O teto real desta máquina
+
+- A GPU faz **bem menos** que o frame: o relógio do cartão mostra 50–73 % de
+  "ocupado", e boa parte disso é a placa **parada com trabalho na fila** enquanto
+  a CPU grava as listas (265 ms por frame nesse estado). O frame não é limitado
+  pela placa.
+- O teto é a **banda de memória da CPU** mais a **thread principal serial**.
+  Cortar o snapshot e a comparação inteiros levaria o frame a ~300 ms — 3,3 fps.
+  É o máximo do caminho de cópia atual.
+- Para 30 fps seria preciso reduzir o tráfego de coerência de 1,4 GB para ~50 MB
+  por frame, ou seja **parar de perguntar à memória o que mudou**. As duas saídas
+  são grandes: máscara de páginas sujas escrita pelos shaders (projeto de
+  emissor), ou memória do convidado que a GPU escreve direto (outro backend).
 
 ## Próximas otimizações, por ordem de retorno
 
-1. **Dirty mask na GPU** (o item que falta): cada store dos shaders traduzidos
-   marca 1 bit por página de 64 KiB; a CPU lê 1,4 KB por frame. Elimina
-   snapshot (94–119 ms) e comparação (168–227 ms) de uma vez.
-2. **Paralelizar os landings do relé**: com CPU a 48 %, as 4 landings por frame
-   são seriais na thread do relé.
-3. **Cópias título → host**: 1,1 GB/s via `ReadProcessMemory`. O `memcpy`
-   protegido existe (`fastcopy.c`) mas precisa de um grão de bloco que não
-   pague o custo da exceção; a tentativa de 64 KiB não pagou.
+1. **"Antes" incremental em vez de snapshot por frame** (o item que falta, e o
+   mais barato dos grandes): hoje o "antes" é copiado inteiro (577–696 MB) a cada
+   submissão. Se cada escrita na cópia — o refresh e o merge do que os shaders
+   escreveram — também for aplicada à imagem "antes", ela fica sempre igual à
+   cópia e o snapshot por frame some. O tráfego cai de 577 MB para ~230 MB
+   (69 MB do merge + 160 MB do refresh). Vale ~90 ms de wall e ~0,5 s de CPU.
+2. **Coalescer os runs do refresh**: 4 500–8 600 chamadas de ~38 KB por frame. Se
+   o custo for por chamada (percurso de tabela de página do kernel), juntar runs
+   separados por menos de uma página corta a conta em ordem de grandeza.
+3. **Dirty mask na GPU** (o item grande): cada store dos shaders traduzidos marca
+   1 bit por página de 64 KiB; a CPU lê 1,4 KB por frame. Elimina snapshot e
+   comparação de uma vez — mas é projeto de emissor de shader, não de uma rodada.
+4. **Os 170 ms de gravação de listas** (34 µs por draw, 10× o que uma camada
+   D3D12 bem escrita gasta). Precisa de um profiler de amostragem na thread
+   principal; o build `diagnostics` não serve (6–13 s por frame).
 
