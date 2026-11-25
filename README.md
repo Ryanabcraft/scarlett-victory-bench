@@ -25,15 +25,17 @@ ceiling lamps, bunks, doorway not overexposed):
 
 | | before | after |
 |---|---|---|
-| fps | 1.3–1.6 | **1.8–2.1** |
-| ms/frame | 600–890 | **486–546** |
-| CPU | 70–97 % | 48 % |
-| GPU (the runtime's own count) | 18–26 % | 35 % |
-| image | correct | correct |
+| fps | 1.3–1.6 | **1.7–2.0** |
+| ms/frame | 600–890 | **506–595** |
+| CPU | 70–97 % | **46–53 %** |
+| GPU (the runtime's own count) | 18–26 % | 31–47 % |
+| image | materials in fallback: flat clothes, black ground | **lit and textured** |
 | crashes | 0 | 0 |
 
 The GPU sitting at 20 % with the CPU at 90 % was the tell: the submitting
-thread was the bottleneck, and the frame line said where it went.
+thread was the bottleneck, and the frame line said where it went. The image
+was the second tell, and it had a different cause — a display mode the title
+had no business believing (see below).
 
 ### 1. The title was rendering at 4K into a 1080p window
 

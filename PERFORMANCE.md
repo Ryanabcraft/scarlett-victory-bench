@@ -85,28 +85,31 @@ botão de controle, e com um controle real conectado o teclado não a alcança.
 
 ## Resultado medido
 
-Build atual, dentro do mundo, mesma cena (interior da cela com a janela gradeada):
+Build atual, dentro do mundo, cena de ~5 040 draws, **sem nenhuma variável de
+display** (o default do código reporta o monitor):
 
 | | antes | agora |
 |---|---|---|
-| fps | 1,3–1,6 | **1,8–2,1** |
-| ms/frame | 600–890 | **486–546** |
-| pior frame (streaming) | 5 400–6 900 ms | 5 400–6 900 ms (não mexido) |
-| draws/frame | 6 886–8 074 | 5 000–6 900 |
-| CPU | 70–97 % | 48 % |
-| GPU (medidor do runtime) | 18–26 % | 35 % |
-| imagem | correta | correta |
+| fps | 1,3–1,6 | **1,7–2,0** |
+| ms/frame | 600–890 | **506–595** |
+| CPU | 70–97 % | **46–53 %** |
+| GPU (medidor do runtime) | 18–26 % | 31–47 % |
+| draws/frame | 6 886–8 074 | ~5 040 |
+| imagem | material em fallback (camisa chapada, chão preto) | **cena iluminada e texturizada** |
 | crashes | 0 | 0 |
 
 Onde o frame vai agora:
 
 | Etapa | Custo | Antes |
 |---|---|---|
-| comparação do que os shaders escreveram (relé) | 168–227 ms | 267–309 ms |
-| snapshots dos ranges declarados | 94–119 ms | 130–169 ms |
-| cópias título → host | 99–142 ms | 155–207 ms |
-| trabalho/espera da GPU | 136–224 ms | 94–200 ms |
-| fetch da GPU | **1,4–2,1 ms** | 150–197 ms |
+| comparação do que os shaders escreveram (relé) | 179–184 ms | 267–309 ms |
+| snapshots dos ranges declarados | 98–110 ms | 130–169 ms |
+| cópias título → host | 64–182 ms | 155–207 ms |
+| trabalho/espera da GPU | 160–280 ms | 94–200 ms |
+| fetch da GPU | **1,4–5,2 ms** | 150–197 ms |
+
+Dois terços do frame ainda são o caminho de cópia na CPU (relé + snapshots =
+278–300 ms de ~550). A GPU não é mais o teto: ela fica a 31–47 %.
 
 ## Atualização do upstream (`921d8d3` → `2e01ab4`)
 
