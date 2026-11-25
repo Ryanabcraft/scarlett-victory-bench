@@ -220,10 +220,14 @@ struct Mode {
 const _: () = assert!(size_of::<Mode>() == 32);
 
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
-/// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
-/// shortcut: not yet the host display's own size by default; make it so
-/// once a title is seen to render for the mode it is given.
+/// if set (as a console reports the television it is plugged into: a Series X
+/// on a 1080p set lists a 1080p mode), else the PC's own screen.
+///
+/// It used to be 3840x2160 whatever the screen was, with a `shortcut:` asking
+/// for this once a title was seen to render for the mode it is given. It was:
+/// told 4K on a 1080p window the title built 4K targets, drew four times the
+/// pixels, and its textures waited for the VRAM those targets held. Told the
+/// screen's own size the same scene came out lit and textured.
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
@@ -233,11 +237,26 @@ fn display_size() -> (u32, u32) {
         });
         let size = match asked {
             Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
+            _ => screen_size().unwrap_or((3840, 2160)),
         };
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
         size
     })
+}
+
+/// The primary screen's size, or `None` when it is not a plausible one.
+#[cfg(windows)]
+fn screen_size() -> Option<(u32, u32)> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    // SAFETY: plain queries of the primary display's size.
+    let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    let (w, h) = (u32::try_from(w).ok()?, u32::try_from(h).ok()?);
+    ((640..=7680).contains(&w) && (360..=4320).contains(&h)).then_some((w, h))
+}
+
+#[cfg(not(windows))]
+fn screen_size() -> Option<(u32, u32)> {
+    None
 }
 
 /// The console's mode list: one 4K mode at 60 Hz (the title looks
