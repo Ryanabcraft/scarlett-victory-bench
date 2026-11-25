@@ -35,7 +35,34 @@ ceiling lamps, bunks, doorway not overexposed):
 The GPU sitting at 20 % with the CPU at 90 % was the tell: the submitting
 thread was the bottleneck, and the frame line said where it went.
 
-### 1. The GPU fetch no longer blocks the frame
+### 1. The title was rendering at 4K into a 1080p window
+
+`display_size()` in `crates/victory-gpu/src/dxgi.rs` reports **3840×2160** to the
+title by default — the console mode, not the PC's display. Every run's log said
+so:
+
+```
+INFO victory_gpu::dxgi: display mode reported to the title width=3840 height=2160
+```
+
+So the title built 4K render targets, drew 8.3 million pixels a frame, and the
+runtime squeezed the result into a 1920×1080 window. The 4K targets also ate the
+VRAM the textures needed (9 194 waiting).
+
+`VICTORY_DISPLAY_MODE=1920x1080` tells it the truth. Same scene, measured:
+
+| | 4K reported | 1080p reported |
+|---|---|---|
+| image | flat-shirted characters, black ground, floating cars | sunset, god rays, textured ground, plants, people in the yard, glass with reflection |
+| GPU busy | 30–50 % | **21–27 %** |
+| GPU wait | 122–410 ms | **122–256 ms** |
+| ms/frame | 588–760 | **573–650** |
+
+The bigger win is the image and the ceiling, not the frame rate: with the GPU at
+21–27 % and the CPU at 47 %, the frame is now entirely the copy path on the CPU.
+The screenshots stay out of the repository: game files and run logs never go in.
+
+### 2. The GPU fetch no longer blocks the frame
 
 `relay_card_back` in `crates/victory-gpu/src/host.rs` emitted a fetch of the
 bytes shaders wrote to copies in the card's memory and then **waited for it on
@@ -49,20 +76,20 @@ The card runs the fetch while the CPU works.
 |---|---|---|
 | fetch per frame | 150–197 ms | **1.4–2.1 ms** |
 
-### 2. The `copying back` cost is now split and reported
+### 3. The `copying back` cost is now split and reported
 
 `BACK_PARTS` separates the time into relay merge, relay fetch, settle card
 fetch/merge, submit card fetch/merge and snapshots, printed on its own line
 every five seconds. Every optimisation below was chosen from that line.
 
-### 3. More threads where the memory work is
+### 4. More threads where the memory work is
 
 `wide()` in `crates/victory-gpu/src/shadow.rs` sized its pool at
 `available_parallelism() / 4` — two threads on an eight-thread machine — and is
 now `available_parallelism() - 2`, capped at 8. Snapshots went from 130 ms to
 94 ms.
 
-### 4. `VICTORY_AUTO_ENTER` — a run with nobody at the keyboard
+### 5. `VICTORY_AUTO_ENTER` — a run with nobody at the keyboard
 
 `crates/victory-hle/src/modules/gameinput.rs`. The title's account picker takes
 a **pad** button, and with no pad opened the keyboard drives the stand-in pad —
@@ -149,9 +176,10 @@ first run then spends minutes at 10–12 s a frame compiling pipelines mid-game
 (`dropped 764 without a host pipeline (961 being made)`). The preloader
 translates and compiles everything up front instead.
 
-Measured cost of the merge itself (`921d8d3` → `2e01ab4`) in this fork: 486–546
-ms → 588–760 ms per frame, mostly relay merge and snapshots; the previous
-build is the commit before it if you need to go back.
+Measured cost of the merge itself (`921d8d3` → `2e01ab4`) in this fork: **none
+on the same scene** — 499–506 ms against 486–546 ms before it, with a warm
+shader cache and ~1 000 draws. The 588–760 ms seen at first was a 5 000-draw
+scene, not the merge.
 
 ## Upstream
 

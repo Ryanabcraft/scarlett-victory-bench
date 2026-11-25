@@ -130,22 +130,25 @@ parte alocação nova e page fault, não cópia.
 
 | | antes do merge | com o merge |
 |---|---|---|
-| fps | 1,8–2,1 | **1,5–1,7** |
-| ms/frame | 486–546 | **588–760** |
-| draws/frame | 5 000–6 900 | 4 484–5 182 |
-| cópias título → host | 99–142 ms | 115–182 ms |
-| trabalho/espera da GPU | 136–224 ms | 122–379 ms |
-| copying back | 358–428 ms | 433–517 ms |
-| relay merge | 168–227 ms | 234–306 ms |
-| snapshots | 94–119 ms | 125–134 ms |
+| fps | 1,8–2,1 | **1,5–2,0** |
+| ms/frame (cena leve, ~1 000 draws) | 486–546 | **499–506** |
+| ms/frame (cena pesada, ~5 000 draws) | — | 588–760 |
+| draws/frame | 5 000–6 900 | 976–5 182 |
+| cópias título → host | 99–142 ms | 64–182 ms |
+| trabalho/espera da GPU | 136–224 ms | 122–410 ms |
+| relay merge | 168–227 ms | 124–306 ms |
+| snapshots | 94–119 ms | 99–134 ms |
 | imagem | correta | correta |
 | crashes | 0 | 0 |
 
-**O pool novo não ajudou aqui — piorou os snapshots (94–119 → 125–134 ms)**, e o
-relay merge subiu junto. As duas medidas não são da mesma cena (draws e % de GPU
-diferem), então o número honesto é: o merge custa **~70–150 ms por frame** nesta
-máquina, e não é regressão do caminho de memória que este fork mexeu. O commit
-`f3a0fdc` é a build anterior ao merge, inteira, se for preciso voltar.
+**Veredito: o merge é neutro, não é regressão.** Na mesma cena (o interior do
+começo, ~1 000 draws, cache quente) deu **499–506 ms** contra 486–546 da build
+anterior — dentro da variação de cena. Os 588–760 ms da primeira medição eram
+uma cena de **5 000 draws**, não o merge. O número anterior de "70–150 ms de
+custo" estava errado: era comparação de cenas diferentes.
+
+O pool novo de snapshots do upstream também não mudou nada aqui: 99–113 ms com
+ele, 94–119 sem.
 
 ### Cache de shader: o merge invalida os 5 GB
 
@@ -165,6 +168,38 @@ target\release\victory-warm.exe "D:\...\game_scarlett_master.exe"
 Regra prática: **mudou o emissor de shader (qualquer merge do upstream mexe),
 rode o `warm-shaders.bat` antes de medir fps.** Medir com cache frio dá 12 s por
 frame e não diz nada sobre o runtime.
+
+## O jogo estava renderizando em 4K
+
+O runtime informa ao título qual televisão está plugada. O default do
+`display_size()` em `crates/victory-gpu/src/dxgi.rs` é **3840×2160** — com um
+`shortcut:` do próprio autor dizendo que ainda não usa o tamanho do monitor do
+PC. O log de toda run provava:
+
+```
+INFO victory_gpu::dxgi: display mode reported to the title width=3840 height=2160
+```
+
+Numa janela de 1920×1080. O jogo montava os alvos em 4K, desenhava **4× os
+pixels** e o runtime encolhia para a janela. Consequência medida: alvos de 4K
+comendo VRAM que faltava para as texturas (9 194 esperando) e GPU a 30–50 %.
+
+`VICTORY_DISPLAY_MODE=1920x1080` diz a verdade ao título. Medido, mesma cena:
+
+| | 4K reportado | 1080p reportado |
+|---|---|---|
+| imagem | camisa chapada, chão preto, carro flutuando, cubo cinza | pôr do sol, god rays, chão texturizado, plantas, gente no pátio, vidro com reflexo |
+| GPU ocupada | 30–50 % | **21–27 %** |
+| espera da GPU | 122–410 ms | **122–256 ms** |
+| ms/frame | 588–760 | **573–650** |
+| fps | 1,5–2,0 | 1,5–1,7 |
+| texturas esperando | 9 194 | 17 051 → 8 996 caindo |
+
+**O ganho maior não é fps, é imagem e teto.** O frame agora tem GPU a 21–27 % e
+CPU a 47 %: o gargalo virou 100 % o caminho de cópia na CPU (`relay merge
+230–312 ms + snapshots 126–140 ms`), não a placa. Antes a GPU mascarava isso.
+
+Prova: print da cena em `logs/shot-1080p.png` (fora do repo, `/logs/` é ignorado).
 
 ## O que foi tentado e descartado (com o número)
 
