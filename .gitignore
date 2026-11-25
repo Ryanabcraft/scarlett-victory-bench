@@ -75,3 +75,7 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Run logs and screenshots from this fork's benchmarks.
+/logs/
+

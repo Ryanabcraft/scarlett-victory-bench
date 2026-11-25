@@ -432,7 +432,40 @@ impl Hub {
             } else {
                 None
             };
-            let keys = source.keys();
+            let mut keys = source.keys();
+            // `VICTORY_KEYS` / `VICTORY_AUTO_ENTER`: the same keys, held as
+            // if the keyboard had them. With no pad here the keyboard drives
+            // the stand-in pad, and the stand-in reads these; with one, the
+            // keys press its buttons too. A run with nobody at the keyboard
+            // has neither.
+            let scripted_keys = scripted();
+            if !scripted_keys.is_empty() {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::info!(keys = ?scripted_keys, "scripted keys pressed");
+                });
+            }
+            for &vk in &scripted_keys {
+                if !keys.iter().any(|k| k.virtual_key == vk) {
+                    keys.push(KeyState {
+                        virtual_key: vk,
+                        scan_code: match vk {
+                            0x0D => 0x1C,
+                            _ => 0,
+                        },
+                        ..Default::default()
+                    });
+                }
+            }
+            let (mut pads, mut native) = (pads, native);
+            for &vk in &scripted_keys {
+                let Some(&(_, button)) = FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) else {
+                    continue;
+                };
+                if let Some(pad) = pads.iter_mut().flatten().next().or(native.as_mut()) {
+                    pad.buttons |= button;
+                }
+            }
             #[cfg(feature = "diagnostics")]
             let (pads, native, keys) = {
                 let (mut pads, mut native, mut keys) = (pads, native, keys);
@@ -1136,6 +1169,66 @@ pub(crate) fn module() -> HleModule {
 }
 
 /// Host input: XInput pads, the keyboard while our process has focus.
+/// `VICTORY_AUTO_ENTER=<seconds>` presses A (Enter on the stand-in pad)
+/// that long after input starts, and again every that many seconds up to
+/// five minutes: the title's start screen takes a pad button, and a run
+/// with nobody at the keyboard has none. `VICTORY_KEYS` takes over when
+/// it is set.
+///
+/// `VICTORY_KEYS=<seconds>:<key>,...` holds each key for 0.2 s that long
+/// after input starts, with or without focus. A key is a letter, a digit,
+/// or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the
+/// stand-in pad's table maps them to buttons).
+fn scripted() -> Vec<u8> {
+    static SCRIPT: std::sync::LazyLock<(Instant, Vec<(Duration, u8)>)> =
+        std::sync::LazyLock::new(|| {
+            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
+            if list.trim().is_empty()
+                && let Ok(at) = std::env::var("VICTORY_AUTO_ENTER")
+                && let Ok(at) = at.trim().parse::<f64>()
+                && at.is_finite()
+                && at > 0.0
+            {
+                // Every `at` seconds, up to five minutes.
+                let mut keys = Vec::new();
+                let mut when = at;
+                while when <= 300.0 {
+                    keys.push((Duration::try_from_secs_f64(when).unwrap_or_default(), 0x0Du8));
+                    when += at;
+                }
+                return (Instant::now(), keys);
+            }
+            let keys = list.split(',').filter_map(|entry| {
+                let (at, key) = entry.split_once(':')?;
+                let vk = match key.trim() {
+                    "Enter" => 0x0D,
+                    "Esc" => 0x1B,
+                    "Tab" => 0x09,
+                    "Back" => 0x08,
+                    "Up" => 0x26,
+                    "Down" => 0x28,
+                    "Left" => 0x25,
+                    "Right" => 0x27,
+                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                        k.as_bytes()[0].to_ascii_uppercase()
+                    }
+                    _ => return None,
+                };
+                Some((
+                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                    vk,
+                ))
+            });
+            (Instant::now(), keys.collect())
+        });
+    let (start, keys) = &*SCRIPT;
+    let now = start.elapsed();
+    keys.iter()
+        .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+        .map(|&(_, vk)| vk)
+        .collect()
+}
+
 #[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
@@ -1225,7 +1318,6 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
@@ -1264,7 +1356,16 @@ mod host {
         }
 
         fn native_pad(&mut self) -> Option<PadState> {
-            self.dualsense.poll()
+            let mut pad = self.dualsense.poll()?;
+            // `VICTORY_KEYS` and `VICTORY_AUTO_ENTER` press this pad's
+            // buttons too: a real pad is present, so the keyboard's stand-in
+            // is not, and the title's start screen listens to the pad.
+            for vk in scripted() {
+                if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                    pad.buttons |= button;
+                }
+            }
+            Some(pad)
         }
 
         #[cfg(feature = "diagnostics")]
@@ -1309,44 +1410,7 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
-    fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
-        });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
-    }
+
 
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {

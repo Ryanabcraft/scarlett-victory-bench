@@ -101,6 +101,9 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// The card's side is this side (both in the PC's memory): what changed
+    /// on the CPU's side is already there and nothing is sent up.
+    same: bool,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -189,6 +192,24 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
     (size / PIECE as u64 + 2) * 64 * 16
 }
 
+/// Whether a big title buffer's copy is compared on the card with the copy
+/// itself in the PC's memory (`VICTORY_CARD_BUFFERS_IN_RAM=1`; **off**):
+/// the card reads it over the bus and stores only the hashes it makes. It
+/// was tried to get the copies out of a card of 8 GB, where only one of the
+/// world's ten big buffers fitted. It is off because reading 700 MB over the
+/// bus every frame cost more than the CPU's compare: 459–467 ms of GPU wait
+/// and 574–587 ms copying back, against 62–213 ms and 340–468 ms.
+fn card_side_here(size: u64) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_CARD_BUFFERS_IN_RAM").is_some_and(|v| v == "1")
+            && cards()
+            && size >= card_limits().0
+            && size < 1 << 30
+            && host().is_some_and(|host| host.card_ready())
+    })
+}
+
 /// A buffer of `size` bytes in the card's memory for a title buffer's
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
@@ -199,10 +220,12 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     let (least, most) = card_limits();
     if size < least || size >= 1 << 30 {
+        tracing::debug!(size, least, "card copy refused: size");
         return None;
     }
     let host = host()?;
     if !host.card_ready() {
+        tracing::debug!(size, "card copy refused: not ready");
         return None;
     }
     // Only while the card has room: with this copy on it, a fifth of the
@@ -214,10 +237,12 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
+        tracing::info!(size, used, budget, "card copy refused: no room on the card");
         return None;
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        tracing::info!(size, most, "card copy refused: the copies' budget");
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -307,6 +332,11 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
                 let ranges = std::mem::take(&mut *dirty);
+                if c.same {
+                    // Both sides are one buffer: what changed on the CPU's
+                    // side is already where the card reads it.
+                    return Vec::new();
+                }
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.retain(|s| s.2 > fetched);
@@ -1082,7 +1112,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = std::thread::available_parallelism().map_or(4, |n| n.get().saturating_sub(2)).clamp(2, 8);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -3017,26 +3047,48 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                    size,
-                };
-                (on_card, Some(card))
+        // A big one, with `cards`: the compare runs on the card over the
+        // CPU's own side. It used to be a second buffer in the card's
+        // memory; on a card of 8 GB the copies did not fit there (only one
+        // of the world's ten big buffers was made), so the card reads this
+        // one over the bus instead. Nothing is sent up (both sides are the
+        // same bytes) and nothing is fetched back for the CPU to compare.
+        let (buffer, card) = if card_side_here(size) {
+            tracing::info!(
+                start = format_args!("{:#x}", key.0),
+                len,
+                "a buffer's host copy is compared on the card, in the PC's memory"
+            );
+            let card = Card {
+                staging: buffer.clone(),
+                before: Mutex::default(),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                size,
+                same: true,
+            };
+            (buffer, Some(card))
+        } else {
+            match card_for(size) {
+                Some(on_card) => {
+                    crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's host copy is in the card's memory"
+                    );
+                    let card = Card {
+                        staging: buffer,
+                        before: Mutex::default(),
+                        dirty: Mutex::default(),
+                        sent: Mutex::default(),
+                        size,
+                        same: false,
+                    };
+                    (on_card, Some(card))
+                }
+                None => (buffer, None),
             }
-            None => (buffer, None),
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -3249,6 +3301,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
+                same: false,
             };
             (on_card, Some(card))
         }

@@ -1,69 +1,143 @@
-# DexNom Runtime
+# Scarlett VIctory Bench
 
-DexNom Runtime is a community fork of Marvisak's VIctory for Windows x64. It runs an Xbox Series executable from your own game installation and translates its GPU work for Direct3D 12. It builds on the Radeon runtime tested at `e061c69032b84ec6e2ec17340469cd689500dafd` and adds fixes for static sampler selection, wave64 lane masks and integer render targets. Game files, executables, saves and generated shader caches stay on your own computer.
+A fork of [DexNom/VIctory](https://github.com/DexNom/VIctory), which is itself a
+community fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory): it
+runs an Xbox Series executable from your own game installation and translates
+its GPU work for Direct3D 12 on Windows x64.
+
+This fork exists for one reason: **the frame the runtime produces was bound by
+memory traffic, not by the GPU, and nobody had measured it.** Everything here is
+a measurement, the fix that came out of it, and the ones that were tried and
+made it worse (kept in the code, switched off, with the numbers in the comment
+above them).
+
+Game files, executables, saves and generated shader caches stay on your own
+computer. Nothing from the game is in this repository — see
+[`docs/asset-policy.md`](docs/asset-policy.md).
+
+## What changed, and why
+
+Measured on **Intel Core i3-10105 (4 cores / 8 threads), 32 GB DDR4, GeForce RTX
+3050 8 GB, Windows 11**, inside the world, same scene. Upstream's own numbers
+come from a Radeon RX 7900 XTX; this fork is the NVIDIA side of that, and the
+interior lighting the upstream test report calls wrong renders here (lit
+ceiling lamps, bunks, doorway not overexposed):
+
+| | before | after |
+|---|---|---|
+| fps | 1.3–1.6 | **1.8–2.1** |
+| ms/frame | 600–890 | **486–546** |
+| CPU | 70–97 % | 48 % |
+| GPU (the runtime's own count) | 18–26 % | 35 % |
+| image | correct | correct |
+| crashes | 0 | 0 |
+
+The GPU sitting at 20 % with the CPU at 90 % was the tell: the submitting
+thread was the bottleneck, and the frame line said where it went.
+
+### 1. The GPU fetch no longer blocks the frame
+
+`relay_card_back` in `crates/victory-gpu/src/host.rs` emitted a fetch of the
+bytes shaders wrote to copies in the card's memory and then **waited for it on
+the spot** — five times a frame, to move 1.9 MB.
+
+It now emits the fetch, parks the pieces in `RelayFetch::pending`, and
+`relay_fetch_merge` only waits **after** the CPU has merged the other copies.
+The card runs the fetch while the CPU works.
+
+| | before | after |
+|---|---|---|
+| fetch per frame | 150–197 ms | **1.4–2.1 ms** |
+
+### 2. The `copying back` cost is now split and reported
+
+`BACK_PARTS` separates the time into relay merge, relay fetch, settle card
+fetch/merge, submit card fetch/merge and snapshots, printed on its own line
+every five seconds. Every optimisation below was chosen from that line.
+
+### 3. More threads where the memory work is
+
+`wide()` in `crates/victory-gpu/src/shadow.rs` sized its pool at
+`available_parallelism() / 4` — two threads on an eight-thread machine — and is
+now `available_parallelism() - 2`, capped at 8. Snapshots went from 130 ms to
+94 ms.
+
+### 4. `VICTORY_AUTO_ENTER` — a run with nobody at the keyboard
+
+`crates/victory-hle/src/modules/gameinput.rs`. The title's account picker takes
+a **pad** button, and with no pad opened the keyboard drives the stand-in pad —
+but only while the window has focus, which a headless run does not have.
+`VICTORY_AUTO_ENTER=<seconds>` presses A every that many seconds for five
+minutes by injecting the key into the keyboard state the stand-in pad reads.
+`VICTORY_KEYS` no longer needs `--features diagnostics`.
+
+## What was tried and made it worse
+
+Kept in the code, off by default, with the reason and the number written above
+the switch.
+
+| Switch | Result |
+|---|---|
+| `VICTORY_CARD_BUFFERS_IN_RAM=1` — compare on the card over the copy in the PC's memory | 710–748 ms; 700 MB a frame over the bus costs more than the CPU's compare |
+| `VICTORY_FAST_COPY=1` — `memcpy` guarded by SEH (`fastcopy.c`) | copies 127–205 ms against 104–147; one missing page fails the whole range |
+| `VICTORY_INPLACE=2` | the driver refuses the big buffers (view memory) |
+| `VICTORY_CARD_BUFFERS=0` | the world never loads |
+| `VICTORY_CARD_REHASH_RUNS=1` + `VICTORY_JOIN_COPIES=1` | 660–1193 ms, more traffic |
+
+## Where the frame goes now
+
+| Stage | Cost per frame |
+|---|---|
+| comparing what shaders wrote (relay) | 168–227 ms |
+| snapshots of the declared ranges | 94–119 ms |
+| title → host copies | 99–142 ms |
+| GPU work and wait | 136–224 ms |
+| GPU fetch | 1.4–2.1 ms |
+
+CPU at 48 % and GPU at 35 % means neither is saturated: the frame is
+**synchronisation latency and memory bandwidth**. The readback path moves
+**1.4 GB per frame to find 1.9 MB of changed bytes** — 705 MB of snapshot and
+705 MB × 2 of comparison, at ~6.5 GB/s with six threads, which is this
+machine's practical ceiling.
+
+The next step is a **dirty mask written by the shaders themselves** — one bit
+per 64 KiB page, 1.4 KB a frame instead of 1.4 GB. The comment on
+`Shadow::writing` has asked for it since before this fork.
+
+The second half of the ceiling is the GPU: 136–224 ms a frame on an RTX 3050
+inside the world. Even with a free CPU that is ~5–7 fps. 30 fps here would mean
+fewer draws, a lower resolution or lower quality — an image decision, not a
+code one.
+
+Full numbers, method and every discarded attempt:
+[`PERFORMANCE.md`](PERFORMANCE.md).
 
 ## Run it on your PC
 
-1. Use 64-bit Windows and a current Direct3D 12 driver. The game uses mesh shaders and Shader Model 6.6. The Radeon gameplay results and known issues are listed below.
-2. Install Rust for Windows and Visual Studio Build Tools. In the Visual Studio installer, select **Desktop development with C++**, including the x64 MSVC toolset and a Windows 10 or 11 SDK. [Rust installer](https://rustup.rs/) · [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-3. Download this repository using **Code → Download ZIP**, extract the ZIP to a writable folder, and double-click **Setup.cmd**. Select the Series X game executable inside your own extracted game installation. Keep its accompanying files together. Setup downloads the pinned build dependencies, verifies the BCPack format tables, and compiles the three Windows programs locally. [Download source ZIP](https://github.com/DexNom/VIctory/archive/refs/heads/main.zip)
-4. Open **DexNom Runtime** from the Windows Start menu. Use a controller for the game's first-time setup. The launcher and your local data are in `%LOCALAPPDATA%\DexNom Runtime`. Saves are in `state`, shader caches in `cache`, and per-run diagnostics in `logs`. The file `logs\latest.txt` points to the latest game log.
+1. 64-bit Windows and a current Direct3D 12 driver. The game uses mesh shaders
+   and Shader Model 6.6.
+2. Rust for Windows and Visual Studio Build Tools with **Desktop development
+   with C++** (x64 MSVC toolset and a Windows 10/11 SDK).
+3. `powershell -File .\Initialize-FormatTables.ps1` — verifies and installs the
+   BCPack format tables (SHA-256 checked; `-FromCheckout <dir>` takes them from
+   a local checkout instead of downloading).
+4. `cargo build --release -p victory --bins`
+5. `start.bat` — edit the game path in it first. It sets `VICTORY_AUTO_ENTER=8`
+   so the account picker passes on its own; `0` turns that off.
 
-To update, close the runtime, extract the new source ZIP, and run **Setup.cmd** again. It reuses the saved game path and the same save directory. To select a different installation, pass its executable path to Setup from PowerShell:
+`start-rt.bat` runs the same build with `--rt` (structure builder, ray traversal
+and light resolve). On an RTX 3050 expect seconds per frame.
 
-```powershell
-.\Setup.cmd -GamePath "D:\My Games\Series X\game_scarlett_master.exe"
-```
+## Upstream
 
-To warm the shader cache, open `victory-warm.exe` in the installed runtime directory. The log lists translated and refused shaders. Graphics pipelines also depend on draw state encountered during play. If you see a missing `VCRUNTIME140.dll` error, install Microsoft's x64 redistributable. [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
+- [DexNom/VIctory](https://github.com/DexNom/VIctory) — the snapshot this fork
+  starts from (`921d8d3`).
+- [Marvisak/VIctory](https://github.com/Marvisak/VIctory) — the original
+  Radeon-tested runtime.
 
-For a manual build, run `.\Initialize-FormatTables.ps1`, then `cargo build --locked --release -p victory --features diagnostics --bins`. The release binaries are in `target\release`. Place all three together outside the checkout and pass the game executable path to `victory-play.exe`. Custom data and cache directories are documented in the configuration example. [Configuration example](victory.example.toml)
+Their README is kept as [`README.upstream.md`](README.upstream.md), and
+`BENCHMARK.md` as it was.
 
-## Try experimental ray tracing on Radeon
+## Licence
 
-After running **Setup.cmd**, open **DexNom Runtime (Experimental RT)** from the Windows Start menu. This starts the game with the acceleration-structure builder, ray traversal and lighting resolve enabled. The shortcut uses your existing saves. Open **DexNom Runtime** for the usual renderer.
-
-To start the same RT configuration from PowerShell:
-
-```powershell
-& "$env:LOCALAPPDATA\DexNom Runtime\victory-play.exe" --rt
-```
-
-Chapter 1 City produced in-range ray and triangle intersections on an RX 7900 XTX. The game builds and traverses its acceleration structures through translated Direct3D 12 compute shaders. Frame times can still reach several seconds. Interior lighting, shadows and performance vary by scene. [Ray-tracing implementation](docs/fork-ray-tracing.md) · [City testing](BENCHMARK.md)
-
-## Changes in this snapshot
-
-- Pixel shaders that read neighboring pixels in a 2×2 group now preserve the values at triangle edges. On an RX 7900 XTX, this reduced incorrect edge pixels from 32 to zero in each of two adjoining-triangle tests. Cube-map sampling also selects the correct mip level for explicit gradients and honors the shader's minimum mip level.
-- The ray-tracing memory directory can grow beyond 1,023 backing buffers. Each recorded draw or dispatch uses only the views available when it was recorded. Older command lists keep their original views.
-- Streamed textures can upload when only their middle pages are resident. The runtime merges overlapping memory notifications and rescans tracked textures if the notification queue fills. Previously used depth-only pipelines now warm ahead of speculative material pipelines to reduce missing shadows during loading.
-- Some dock objects still appear black in the City save. The same distant dock fixtures appeared dark with the ray-structure builder disabled. The effect of these changes on those objects and on gameplay FPS is still being tested.
-- GPU readback identifies changed pages and combines adjacent copy ranges. This targets CPU/GPU synchronization and transfer overhead.
-- Ray-structure builder dispatches now honor the game's thread counts and mask excess lanes in the final group. Read-only traversal no longer declares the entire guest memory directory writable when the shader sends its output to another buffer or texture.
-- Texture handling searches for contiguous descriptor slots and admits already-resident textures under memory pressure. Earlier changes address publication order, placed-texture ownership and supported render-XOR layouts.
-- Shaders can choose between two static samplers across a uniform branch. This recovered 40 shader variants from the tested archive. Another fix recovered one voxel visibility shader by recognizing a saved and restored wave64 lane mask. Mixed render targets retain their individual write masks when an integer target bypasses blending.
-- The runtime preserves the game's vertex output interpolation and fixes output signature ordering. All 2,191 archive vertex shaders passed the Microsoft DXIL validator, including 18 water shaders. New textures and retries share the upload budget, and a previously refused buffer view is checked again when its backing allocation changes.
-- The runtime resolves guest addresses from ray-tracing descriptors, preserves raw buffer offsets and prepares the memory each command list reads. Texture uploads can proceed while Windows remaps unrelated memory. In-game ray-traced lighting is still experimental.
-- Five additional shadow compute shaders compile and create pipelines on the RX 7900 XTX. The translated ray-node regression also exercises three reflections through the guest-page directory. Changes confined to the standalone execution tests now preserve cached shader translations.
-- Shader translation preserves the guest wave width for lane permutations and handles heap-indexed texture-size queries. Save handling flushes copied blobs before publication and can recover a complete checkpoint.
-
-The source ZIP builds with the Windows setup script. The test report covers shader validation, a Radeon pipeline check, gameplay frame times and the remaining interior lighting issue. [Test and benchmark report](BENCHMARK.md)
-
-### Testing CPU submission workers
-
-For a local experiment, open PowerShell and run the following after setup. The process uses four CPU workers for eligible upload batches and can record independent transition command lists on the shared worker pool. The final GPU queue, fence signals and resource transitions retain the game's submission order. Compare the same save and camera after the initial streaming period. The default launcher uses the baseline settings.
-
-```powershell
-$env:VICTORY_FILL_WORKERS = '4'
-$env:VICTORY_PARALLEL_PRELUDES = '1'
-& "$env:LOCALAPPDATA\DexNom Runtime\victory-play.exe"
-```
-
-## Credits and licensing
-
-- Marvisak and the VIctory contributors created the original runtime. [Marvisak/VIctory](https://github.com/Marvisak/VIctory)
-- ZSlayerHQ and the contributors to the victory-world line provided the rendering baseline used here, including the Radeon work from triippywhale and asdaasdsaddf. [victory-world-runtime](https://github.com/ZSlayerHQ/victory-world-runtime) · [Integrated revision](https://github.com/ZSlayerHQ/victory-world-runtime/commit/99f8834aa16b98d7f3943b8de262a8d4857bda7b)
-- The XCL contributors published an independent Xbox Series compatibility layer. Their work informed our investigation of shader translation, CPU/GPU memory synchronization and performance. [xcl-dev/xcl](https://github.com/xcl-dev/xcl)
-
-The upstream README preserves the original credits and historical test results. [Upstream README](README.upstream.md)
-
-VIctory source is licensed under GPL-3.0-or-later. The upstream project identifies the required BCPack format tables as separately supplied data outside that license. This source archive omits that file. The setup script verifies a local or upstream copy before use. [License](LICENSE) · [Upstream asset policy and table notice](docs/asset-policy.md)
+See [`LICENSE`](LICENSE).

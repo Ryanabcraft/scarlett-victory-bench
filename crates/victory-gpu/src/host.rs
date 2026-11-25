@@ -346,6 +346,9 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
+static BACK_PARTS: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
@@ -2730,6 +2733,20 @@ struct RelayFetch {
     sent: u64,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// Pieces sent to the card and not merged yet: the fetch waits for the
+    /// card behind other work of ours, so it is emitted before the CPU's
+    /// merge of the other copies and collected after it.
+    pending: Option<Pending>,
+}
+
+/// A fetch [`RelayFetch::pending`]: the pieces, where they land, and what
+/// the queue had received when it was sent.
+struct Pending {
+    pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)>,
+    after: u64,
+    data: usize,
+    owners: crate::writeback::Owners,
+    at: std::time::Instant,
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -3816,6 +3833,7 @@ impl Host {
                 event,
                 sent: 0,
                 buffer: None,
+                pending: None,
             })
         }
     }
@@ -3836,6 +3854,9 @@ impl Host {
         fetch: &mut Option<RelayFetch>,
         owners: &crate::writeback::Owners,
     ) {
+        // A fetch of an earlier landing is waited for here: the card has
+        // had the CPU's merge of the other copies to run it behind.
+        self.relay_fetch_merge(fetch);
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -3912,7 +3933,6 @@ impl Host {
                 drop(order);
                 self.card_sent();
                 fence.SetEventOnCompletion(sent, event)?;
-                WaitForSingleObject(event, INFINITE);
                 Ok(after)
             })()
         };
@@ -3920,29 +3940,56 @@ impl Host {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
-        let us = waiting.elapsed().as_micros() as u64;
-        RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {
             use crate::shadow::CARD_STATS;
             CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
             CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
+        }
+        // The wait for the card is left to `relay_fetch_merge`, after the
+        // CPU's merge of the other copies: the card runs this fetch while
+        // that merge goes on, and its wait then costs almost nothing.
+        f.pending = Some(Pending {
+            pieces,
+            after,
+            data,
+            owners: owners.clone(),
+            at: waiting,
+        });
+    }
+
+    /// [`relay_card_back`]: waits for the fetch it sent and puts what it
+    /// brought into title memory. Called before the next fetch is sent and
+    /// at the end of a landing, so a fetch is never left unmerged.
+    fn relay_fetch_merge(&self, fetch: &mut Option<RelayFetch>) {
+        let Some(f) = fetch.as_mut() else {
+            return;
+        };
+        let Some(p) = f.pending.take() else {
+            return;
+        };
+        // SAFETY: the fence and event are this thread's, and the list's
+        // last run was the fetch that was signalled on them.
+        let _ = unsafe { WaitForSingleObject(f.event, INFINITE) };
+        let us = p.at.elapsed().as_micros() as u64;
+        RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
+        {
+            use crate::shadow::CARD_STATS;
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
         let mut title = Vec::new();
         let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
+        for (shadow, lo, hi, at) in &p.pieces {
+            // SAFETY: the mapping of the fetched bytes; the fetch has run.
             let gpu =
-                unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title, owners);
+                unsafe { std::slice::from_raw_parts((p.data + *at as usize) as *const u8, hi - lo) };
+            let merged = shadow.card_merge_relay(*lo, gpu, p.after, &mut title, &p.owners);
             shadow.walls_merged(gpu.len(), merged);
             written += merged;
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
-        crate::shadow::relay_fetched(after);
+        crate::shadow::relay_fetched(p.after);
     }
 
     /// [`relay`], on the thread that lands flights: `items` are the first
@@ -3978,7 +4025,13 @@ impl Host {
                 let plans: Vec<&CardPlan> =
                     flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 let owners = writeback_owners(flights.iter().copied());
+                let card_at = std::time::Instant::now();
                 self.relay_card_back(&plans, fetch, &owners);
+                BACK_PARTS[5].fetch_add(
+                    card_at.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
+                let hand_at = std::time::Instant::now();
                 let mut back = WriteGroups::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -3986,6 +4039,13 @@ impl Host {
                     }
                 }
                 relay_hand_back(&back.groups, &owners);
+                BACK_PARTS[6].fetch_add(
+                    hand_at.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
+                // The card has run the fetch sent above while the CPU
+                // merged the other copies: it lands here.
+                self.relay_fetch_merge(fetch);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
@@ -4413,12 +4473,15 @@ impl Host {
                 }));
                 let mut seen = std::collections::HashSet::new();
                 let mut back = WriteGroups::new();
+                let mut card_us = 0u64;
                 for item in &items {
                     let Late::Run(flight) = item else {
                         continue;
                     };
                     if let Some(card) = &flight.card {
+                        let at = std::time::Instant::now();
                         self.card_back(card, submitted, &mut seen, &owners);
+                        card_us += at.elapsed().as_micros() as u64;
                     }
                     for (shadow, ranges) in &flight.back {
                         back.add(shadow, ranges);
@@ -4426,6 +4489,11 @@ impl Host {
                 }
                 hand_back(&back.groups, &owners);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+                BACK_PARTS[0].fetch_add(card_us, Ordering::Relaxed);
+                BACK_PARTS[1].fetch_add(
+                    copying.elapsed().as_micros() as u64 - card_us,
+                    Ordering::Relaxed,
+                );
             }
             // In the order given: what tells the title the card is done.
             let mut last = 0;
@@ -4611,9 +4679,9 @@ impl Host {
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
         {
-            #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
             crate::shadow::take_snapshots();
+            BACK_PARTS[4].fetch_add(snapshots.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
@@ -4773,6 +4841,11 @@ impl Host {
                 &owners,
             );
         }
+        let card_done_at = std::time::Instant::now();
+        BACK_PARTS[2].fetch_add(
+            card_done_at.saturating_duration_since(copying).as_micros() as u64,
+            Ordering::Relaxed,
+        );
         let back = declared_writes(runs, false);
         hand_back(&back, &owners);
         crate::writeback::published(this_submission);
@@ -4793,6 +4866,10 @@ impl Host {
             add(C::NothingBackUs, gpu.as_micros() as u64);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        BACK_PARTS[3].fetch_add(
+            std::time::Instant::now().saturating_duration_since(card_done_at).as_micros() as u64,
+            Ordering::Relaxed,
+        );
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
@@ -6379,10 +6456,82 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 pub(crate) fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if fast_copy() && len >= 64 << 10 {
+        // A plain memcpy that takes the fault of a page that is not there
+        // (`fastcopy.c`): 8-10 GB/s against the kernel copy's ~1. A range
+        // with one page missing fails whole, so it is then tried in 64 KiB
+        // blocks: the blocks that are there are copied plainly and only the
+        // one that faults is asked of the kernel.
+        // SAFETY: `dst` is ours and mapped; the source is the title's, and
+        // the copy handles a page of it that is not there.
+        if unsafe { victory_fast_copy(dst, src, len) } != 0 {
+            return true;
+        }
+        FAST_FAILED.fetch_add(1, Ordering::Relaxed);
+        const BLOCK: usize = 64 << 10;
+        if len > BLOCK {
+            let mut at = 0;
+            let mut whole = true;
+            while at < len {
+                let n = BLOCK.min(len - at);
+                // SAFETY: inside the caller's ranges.
+                let ok = unsafe {
+                    victory_fast_copy(dst.add(at), src.add(at), n) != 0
+                };
+                if !ok {
+                    whole = false;
+                    let mut done = 0;
+                    // SAFETY: as above; the kernel checks the source.
+                    unsafe {
+                        ReadProcessMemory(
+                            GetCurrentProcess(),
+                            src.add(at).cast(),
+                            dst.add(at).cast(),
+                            n,
+                            &mut done,
+                        );
+                    }
+                }
+                at += n;
+            }
+            return whole;
+        }
+        let mut done = 0;
+        // SAFETY: as above.
+        return unsafe {
+            ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0
+        };
+    }
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+}
+
+/// Ranges the plain copy gave up on since the start.
+pub(crate) static FAST_FAILED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+unsafe extern "C" {
+    /// `memcpy` with the fault of a source page that is not there taken
+    /// (`fastcopy.c`); 0 when one was.
+    fn victory_fast_copy(dst: *mut u8, src: *const u8, len: usize) -> i32;
+}
+
+#[cfg(not(windows))]
+unsafe fn victory_fast_copy(_: *mut u8, _: *const u8, _: usize) -> i32 {
+    0
+}
+
+/// Whether the plain copy is used instead of the kernel's
+/// (`VICTORY_FAST_COPY=1`; **off**). It was tried and is off: a range with
+/// one page missing fails whole, and the 64 KiB retry that follows costs
+/// more than the kernel's copy it replaces (copies 127–205 ms against
+/// 104–147 ms without it, 5,040 faults a run).
+fn fast_copy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAST_COPY").is_some_and(|v| v == "1"))
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -6760,6 +6909,26 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        {
+            let p: Vec<f64> = BACK_PARTS
+                .iter()
+                .map(|c| c.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames)
+                .collect();
+            tracing::info!(
+                "copying back split, per frame: relay merge {:.1} ms + fetch {:.1} ms, \
+                 settle card fetch {:.1} ms + merge {:.1} ms, \
+                 submit card fetch {:.1} ms + merge {:.1} ms, snapshots {:.1} ms \
+                 (sum {:.1} ms)",
+                p[6],
+                p[5],
+                p[0],
+                p[1],
+                p[2],
+                p[3],
+                p[4],
+                p[0] + p[1] + p[2] + p[3] + p[4] + p[5] + p[6]
+            );
+        }
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
