@@ -2516,9 +2516,13 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
         let mut runs_left = 512;
-        return spans.refreshes.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        return spans
+            .iter()
+            .any(|(shadow, from, to)| shadow.merge_under_writes(from, to - from, &mut runs_left));
     }
-    spans.refreshes.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+    spans
+        .iter()
+        .any(|(shadow, from, to)| shadow.stale_under_writes(from, to - from))
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -4625,20 +4629,17 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            let mut spans = Batch::default();
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
                         && !shadow.unwatched()
                     {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                        spans.add(shadow, *address, *len);
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let ranges: Vec<(usize, usize)> = spans.iter().map(|(_, from, to)| (from, to)).collect();
             crate::watch::ask_once(&ranges);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
@@ -6219,9 +6220,77 @@ fn wide_refresh() -> bool {
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
+/// Per-shadow sorted, disjoint `[from, to)` refresh spans in a [`Batch`].
+/// Overlapping and touching intervals coalesce; far-apart intervals stay
+/// separate so refreshes do not copy or stall on unrelated gaps.
+const MAX_BATCH_SPANS: usize = 64;
+
+enum Spans {
+    One((usize, usize)),
+    Many(Vec<(usize, usize)>),
+}
+
+impl Spans {
+    fn add(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        match self {
+            Self::One((a, b)) => {
+                if from <= *b && to >= *a {
+                    *a = (*a).min(from);
+                    *b = (*b).max(to);
+                } else {
+                    let v = if to < *a {
+                        vec![(from, to), (*a, *b)]
+                    } else {
+                        vec![(*a, *b), (from, to)]
+                    };
+                    *self = Self::Many(v);
+                }
+            }
+            Self::Many(v) => coalesce_span(v, from, to),
+        }
+    }
+
+    fn as_slice(&self) -> &[(usize, usize)] {
+        match self {
+            Self::One(range) => std::slice::from_ref(range),
+            Self::Many(ranges) => ranges.as_slice(),
+        }
+    }
+}
+
+fn coalesce_span(spans: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    let pos = spans.partition_point(|&(_, end)| end < from);
+    let mut lo = from;
+    let mut hi = to;
+    let mut erase_end = pos;
+    while erase_end < spans.len() && spans[erase_end].0 <= hi {
+        lo = lo.min(spans[erase_end].0);
+        hi = hi.max(spans[erase_end].1);
+        erase_end += 1;
+    }
+    if pos < erase_end {
+        spans[pos] = (lo, hi);
+        spans.drain(pos + 1..erase_end);
+    } else {
+        spans.insert(pos, (lo, hi));
+    }
+    if spans.len() > MAX_BATCH_SPANS
+        && let Some(best) = (0..spans.len() - 1).min_by_key(|&i| spans[i + 1].0 - spans[i].1)
+    {
+        spans[best].1 = spans[best + 1].1;
+        spans.remove(best + 1);
+    }
+}
+
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Spans)>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -6233,32 +6302,43 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
+        let Some(end) = address.checked_add(len).filter(|&e| e > address) else {
+            return;
+        };
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
-            Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
-            }
+            Some(&at) => self.refreshes[at].1.add(address, end),
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes
+                    .push((shadow.clone(), Spans::One((address, end))));
             }
         }
     }
 
+    fn iter(&self) -> impl Iterator<Item = (&std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+        self.refreshes.iter().flat_map(|(shadow, spans)| {
+            spans
+                .as_slice()
+                .iter()
+                .map(move |&(from, to)| (shadow, from, to))
+        })
+    }
+
     /// Before shaders are given a range of `shadow`'s copy: its pending
-    /// refresh is done, the others stay pending.
+    /// refreshes are done, the others stay pending.
     fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, spans) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        for &(from, to) in spans.as_slice() {
+            Self::update(&shadow, from, to);
+        }
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -6289,14 +6369,18 @@ impl Batch {
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead = self.refreshes.len() > 1
+            || self
+                .refreshes
+                .first()
+                .is_some_and(|(_, s)| s.as_slice().len() > 1);
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
                 .refreshes
                 .iter()
-                .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .filter(|(shadow, _)| !shadow.unwatched())
+                .flat_map(|(_, spans)| spans.as_slice().iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -6310,14 +6394,22 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, spans)| {
+                    Box::new(move || {
+                        for &(from, to) in spans.as_slice() {
+                            Self::update(&shadow, from, to);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            for (shadow, spans) in self.refreshes.drain(..) {
+                for &(from, to) in spans.as_slice() {
+                    Self::update(&shadow, from, to);
+                }
             }
         }
         if ahead {
@@ -7879,5 +7971,112 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn coalesced_spans_keep_disjoint_ranges_separate_and_merge_overlaps() {
+        use super::{MAX_BATCH_SPANS, Spans};
+
+        let mut spans = Spans::One((100, 160));
+        // Subset and touching/overlapping merges stay a single span.
+        spans.add(110, 140);
+        assert_eq!(spans.as_slice(), &[(100, 160)]);
+        spans.add(160, 200);
+        assert_eq!(spans.as_slice(), &[(100, 200)]);
+        spans.add(80, 120);
+        assert_eq!(spans.as_slice(), &[(80, 200)]);
+        spans.add(300, 300); // empty span ignored
+        assert_eq!(spans.as_slice(), &[(80, 200)]);
+
+        // Disjoint out-of-order inserts stay sorted and separate.
+        spans.add(10, 30);
+        spans.add(500, 560);
+        spans.add(300, 360);
+        assert_eq!(
+            spans.as_slice(),
+            &[(10, 30), (80, 200), (300, 360), (500, 560)]
+        );
+
+        // Bridging adjacent/overlapping spans coalesces across them.
+        spans.add(200, 300);
+        assert_eq!(spans.as_slice(), &[(10, 30), (80, 360), (500, 560)]);
+
+        // Exceeding MAX_BATCH_SPANS merges only the smallest gap.
+        let mut bounded = Spans::One((0, 10));
+        for i in 1..MAX_BATCH_SPANS {
+            let start = i * 100;
+            bounded.add(start, start + 10);
+        }
+        assert_eq!(bounded.as_slice().len(), MAX_BATCH_SPANS);
+        // Insert one more very close to slot 1 ([100, 110)) so gap (15..25 vs 100 = 75) is smallest.
+        bounded.add(120, 125);
+        assert_eq!(bounded.as_slice().len(), MAX_BATCH_SPANS);
+        assert!(bounded.as_slice().contains(&(100, 125)));
+    }
+
+    #[test]
+    fn stale_under_flights_and_batch_flush_ignore_unrequested_gaps() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let Some(host) = super::host() else {
+            return;
+        };
+        const PAGE: usize = 64 << 10;
+        let bytes = 4 * PAGE;
+        // Allocate non-write-watched memory so Shadow tracks refreshes across the full span.
+        // SAFETY: plain private anonymous RW pages freed before return.
+        let start = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(start, 0);
+        // SAFETY: zero-initialized allocation of `bytes`.
+        unsafe { std::ptr::write_bytes(start as *mut u8, 0, bytes) };
+        crate::shadow::register(start, start as u64, bytes as u64);
+        let shadow = crate::shadow::find(start as u64, 1).unwrap();
+
+        // Populate guest pages 0, 2, and 3 AFTER creating the shadow so only refreshed ranges update.
+        // SAFETY: distinct pages inside the 4-page allocation.
+        unsafe {
+            std::ptr::write_bytes(start as *mut u8, 0x11, 64);
+            std::ptr::write_bytes((start + 2 * PAGE) as *mut u8, 0x22, 64);
+            std::ptr::write_bytes((start + 3 * PAGE) as *mut u8, 0x33, 64);
+        }
+        // Mark page 1 as an in-flight shader write.
+        shadow.writing(start + PAGE, 64);
+
+        let list1 = host.new_list().unwrap();
+        let list2 = host.new_list().unwrap();
+        let list3 = host.new_list().unwrap();
+        list1.defer_refresh(&shadow, start, 64);
+        list2.defer_refresh(&shadow, start + 3 * PAGE, 64);
+        list3.defer_refresh(&shadow, start + PAGE, 64);
+
+        // Disjoint refreshes on pages 0 and 3 do not intersect page 1's pending write.
+        assert!(!super::stale_under_flights(&[&list1, &list2]));
+        // A refresh covering page 1 itself does trigger stale detection.
+        assert!(super::stale_under_flights(&[&list1, &list3]));
+
+        // Flushing disjoint spans on pages 0 and 3 copies those endpoints without copying page 2.
+        let mut batch = Batch::default();
+        batch.add(&shadow, start, 64);
+        batch.add(&shadow, start + 3 * PAGE, 64);
+        batch.flush();
+        let (p0, p2, p3) = (
+            shadow.byte_at(0),
+            shadow.byte_at(2 * PAGE),
+            shadow.byte_at(3 * PAGE),
+        );
+        assert_eq!(p0, 0x11);
+        assert_eq!(p2, 0x00, "unrequested middle page must not be copied");
+        assert_eq!(p3, 0x33);
+
+        drop(batch);
+        drop(list1);
+        drop(list2);
+        drop(list3);
+        shadow.copy_back_done(&[(start + PAGE, start + PAGE + 64)]);
+        drop(shadow);
+        crate::shadow::unregister(start, start as u64);
+        assert_ne!(unsafe { VirtualFree(start as _, 0, MEM_RELEASE) }, 0);
     }
 }
